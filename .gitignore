@@ -4,3 +4,10 @@ __pycache__/
 data/
 *.db
 *.wav
+
+# C++ (cpp/) build artifacts
+cpp/build/
+cpp/compile_commands.json
+
+# IDE
+.idea/
