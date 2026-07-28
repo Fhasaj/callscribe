@@ -19,7 +19,8 @@ private:
     AppContext& ctx_;
 
     std::string new_task_text_;
-    std::string new_task_due_;
+    std::string new_task_due_;  // typed as DD MM YYYY, converted to ISO on add
+    std::string status_message_;
     bool show_completed_ = false;
     bool needs_refresh_ = false;
 

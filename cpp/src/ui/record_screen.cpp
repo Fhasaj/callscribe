@@ -9,6 +9,7 @@
 #include "config.hpp"
 #include "llm/summarizer.hpp"
 #include "util/clipboard.hpp"
+#include "util/date_format.hpp"
 #include "util/time.hpp"
 #include "util/wav_writer.hpp"
 
@@ -54,31 +55,60 @@ void RecordScreen::build_ui() {
         std::lock_guard<std::mutex> lock(text_mutex_);
         util::copy_to_clipboard(summary_text_);
     });
-    auto copy_summary_maybe = Maybe(copy_summary_btn, [this] {
-        std::lock_guard<std::mutex> lock(text_mutex_);
-        return !summary_text_.empty();
-    });
-
     auto copy_email_btn = Button("Copy Email", [this] {
         std::lock_guard<std::mutex> lock(text_mutex_);
         util::copy_to_clipboard(email_draft_);
     });
-    auto copy_email_maybe = Maybe(copy_email_btn, [this] {
-        std::lock_guard<std::mutex> lock(text_mutex_);
-        return !email_draft_.empty();
+
+    auto live_page = Renderer([this] {
+        std::string transcript_copy;
+        {
+            std::lock_guard<std::mutex> lock(text_mutex_);
+            transcript_copy = live_transcript_;
+        }
+        return frame(paragraph(transcript_copy.empty() ? "(nothing yet)" : transcript_copy)) | flex | border;
     });
+
+    auto summary_page = Renderer(copy_summary_btn, [this, copy_summary_btn] {
+        std::string summary_copy;
+        {
+            std::lock_guard<std::mutex> lock(text_mutex_);
+            summary_copy = summary_text_;
+        }
+        return vbox({
+                   paragraph(summary_copy.empty() ? "(no summary yet)" : summary_copy) | flex | border,
+                   copy_summary_btn->Render(),
+               }) |
+               flex;
+    });
+
+    auto email_page = Renderer(copy_email_btn, [this, copy_email_btn] {
+        std::string email_copy;
+        {
+            std::lock_guard<std::mutex> lock(text_mutex_);
+            email_copy = email_draft_;
+        }
+        return vbox({
+                   paragraph(email_copy.empty() ? "(no email draft yet)" : email_copy) | flex | border,
+                   copy_email_btn->Render(),
+               }) |
+               flex;
+    });
+
+    auto inner_menu = Menu(&inner_tab_titles_, &inner_tab_index_, MenuOption::HorizontalAnimated());
+    auto inner_tab_container = Container::Tab({live_page, summary_page, email_page}, &inner_tab_index_);
 
     auto form = Container::Vertical({
         meeting_input,
         customer_input,
         participants_input,
         start_stop_button,
-        copy_summary_maybe,
-        copy_email_maybe,
+        inner_menu,
+        inner_tab_container,
     });
 
-    root_ = Renderer(form, [this, meeting_input, customer_input, participants_input, start_stop_button,
-                             copy_summary_maybe, copy_email_maybe] {
+    root_ = Renderer(form, [this, meeting_input, customer_input, participants_input, start_stop_button, inner_menu,
+                             inner_tab_container] {
         State state = state_.load();
         std::string status_text = state == State::Idle    ? "Idle"
                                    : state == State::Recording ? "Recording..."
@@ -93,12 +123,9 @@ void RecordScreen::build_ui() {
             elapsed_text = format_mmss(secs);
         }
 
-        std::string transcript_copy, summary_copy, email_copy, error_copy;
+        std::string error_copy;
         {
             std::lock_guard<std::mutex> lock(text_mutex_);
-            transcript_copy = live_transcript_;
-            summary_copy = summary_text_;
-            email_copy = email_draft_;
             error_copy = error_message_;
         }
 
@@ -124,17 +151,9 @@ void RecordScreen::build_ui() {
             children.push_back(text(error_copy) | color(Color::Red));
         }
         children.push_back(separator());
-        children.push_back(text("Live transcript:") | bold);
-        children.push_back(frame(paragraph(transcript_copy.empty() ? "(nothing yet)" : transcript_copy)) | flex |
-                            border);
-
-        if (!summary_copy.empty() || !email_copy.empty()) {
-            children.push_back(separator());
-            children.push_back(hbox({text("Summary:") | bold, filler(), copy_summary_maybe->Render()}));
-            children.push_back(paragraph(summary_copy) | border);
-            children.push_back(hbox({text("Email draft:") | bold, filler(), copy_email_maybe->Render()}));
-            children.push_back(paragraph(email_copy) | border);
-        }
+        children.push_back(inner_menu->Render());
+        children.push_back(separator());
+        children.push_back(inner_tab_container->Render() | flex);
 
         return vbox(children) | flex;
     });
@@ -262,7 +281,7 @@ void RecordScreen::finalize() {
 
     try {
         auto result = llm::summarize_call(ctx_.settings.ollama_host, model, transcript, customer_name_,
-                                           meeting_name_, participants_, util::today_iso());
+                                           meeting_name_, participants_, util::iso_date_to_display(util::today_iso()));
         for (auto& t : result.tasks) {
             ctx_.repo->add_task(t, call_id_, customer_id_, "", "call");
         }

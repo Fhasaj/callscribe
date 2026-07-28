@@ -74,6 +74,7 @@ add_library(callscribe_core STATIC
   src/util/subprocess.cpp
   src/util/clipboard.cpp
   src/util/wav_writer.cpp
+  src/util/date_format.cpp
   src/db/database.cpp
   src/db/repository.cpp
   src/audio/devices.cpp
@@ -123,6 +124,7 @@ if(CALLSCRIBE_BUILD_TESTS)
   add_executable(callscribe_tests
     tests/test_repository.cpp
     tests/test_prompts.cpp
+    tests/test_date_format.cpp
   )
   target_link_libraries(callscribe_tests PRIVATE callscribe_core doctest::doctest)
 

@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "audio/capture.hpp"
 #include "context.hpp"
@@ -41,6 +42,10 @@ private:
     std::string summary_text_;
     std::string email_draft_;
     std::string error_message_;
+
+    // Live/Summary/Email inner tab bar, below the meeting/customer form.
+    std::vector<std::string> inner_tab_titles_ = {"Live", "Summary", "Email"};
+    int inner_tab_index_ = 0;
 
     int64_t call_id_ = -1;
     std::optional<int64_t> customer_id_;

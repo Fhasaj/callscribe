@@ -2,6 +2,8 @@
 
 #include <ftxui/dom/elements.hpp>
 
+#include "util/date_format.hpp"
+
 namespace callscribe::ui {
 
 TasksScreen::TasksScreen(AppContext& ctx) : ctx_(ctx) {
@@ -20,7 +22,7 @@ void TasksScreen::refresh() {
     for (size_t i = 0; i < tasks_.size(); ++i) {
         std::string label = tasks_[i].description;
         if (!tasks_[i].customer_name.empty()) label += "  -- " + tasks_[i].customer_name;
-        if (!tasks_[i].due_date.empty()) label += "  (due " + tasks_[i].due_date + ")";
+        if (!tasks_[i].due_date.empty()) label += "  (due " + util::iso_date_to_display(tasks_[i].due_date) + ")";
         if (tasks_[i].source == "call") label += "  [call]";
 
         CheckboxOption cb_opt;
@@ -54,9 +56,20 @@ void TasksScreen::delete_task_at(int index) {
 
 void TasksScreen::add_task() {
     if (new_task_text_.empty()) return;
-    ctx_.repo->add_task(new_task_text_, std::nullopt, std::nullopt, new_task_due_);
+
+    std::string due_iso;
+    if (!new_task_due_.empty()) {
+        due_iso = util::display_date_to_iso(new_task_due_);
+        if (due_iso.empty()) {
+            status_message_ = "Couldn't parse due date '" + new_task_due_ + "' -- use DD MM YYYY.";
+            return;
+        }
+    }
+
+    ctx_.repo->add_task(new_task_text_, std::nullopt, std::nullopt, due_iso);
     new_task_text_.clear();
     new_task_due_.clear();
+    status_message_.clear();
     needs_refresh_ = true;
 }
 
@@ -72,7 +85,7 @@ void TasksScreen::build_ui() {
 
     InputOption due_opt;
     due_opt.multiline = false;
-    auto due_input = Input(&new_task_due_, "Due YYYY-MM-DD (optional)", due_opt);
+    auto due_input = Input(&new_task_due_, "Due DD MM YYYY (optional)", due_opt);
 
     auto add_button = Button("Add Task", [this] { add_task(); });
 
@@ -99,6 +112,7 @@ void TasksScreen::build_ui() {
                        add_button->Render(),
                    }),
                    show_done_checkbox->Render(),
+                   status_message_.empty() ? text("") : (text(status_message_) | color(Color(Color::Red))),
                    separator(),
                    task_list_container_->Render() | frame | flex,
                }) |

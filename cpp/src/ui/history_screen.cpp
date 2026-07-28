@@ -6,6 +6,7 @@
 
 #include "llm/summarizer.hpp"
 #include "util/clipboard.hpp"
+#include "util/date_format.hpp"
 
 namespace callscribe::ui {
 
@@ -22,9 +23,12 @@ void HistoryScreen::refresh_list() {
     calls_ = ctx_.repo->list_calls("", search_text_);
     call_labels_.clear();
     for (auto& c : calls_) {
-        std::string when = c.started_at.size() >= 16 ? c.started_at.substr(0, 16) : c.started_at;
-        for (auto& ch : when)
-            if (ch == 'T') ch = ' ';
+        std::string when = c.started_at;
+        if (c.started_at.size() >= 16) {
+            std::string date_part = util::iso_date_to_display(c.started_at.substr(0, 10));
+            std::string time_part = c.started_at.substr(11, 5);
+            when = date_part + " " + time_part;
+        }
         call_labels_.push_back(when + " -- " + (c.customer_name.empty() ? "Unknown" : c.customer_name) + " (" +
                                 c.status + ")");
     }
@@ -69,7 +73,7 @@ void HistoryScreen::regenerate() {
         try {
             auto result = llm::summarize_call(ctx_.settings.ollama_host, model, transcript, call.customer_name,
                                                call.meeting_name, call.participants,
-                                               call.started_at.substr(0, 10));
+                                               util::iso_date_to_display(call.started_at.substr(0, 10)));
             for (auto& t : result.tasks) ctx_.repo->add_task(t, call.id, call.customer_id, "", "call");
             ctx_.repo->add_note(call.id, result.summary_text, result.email_draft, "[]");
             std::lock_guard<std::mutex> lock(detail_mutex_);
