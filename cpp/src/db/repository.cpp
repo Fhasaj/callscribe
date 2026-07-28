@@ -78,6 +78,13 @@ void Repository::set_call_status(int64_t call_id, const std::string& status) {
     s.execute();
 }
 
+void Repository::update_manual_notes(int64_t call_id, const std::string& notes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_, "UPDATE calls SET manual_notes = ? WHERE id = ?");
+    s.bind_opt_text(1, notes).bind(2, call_id);
+    s.execute();
+}
+
 namespace {
 Call read_call_row(Stmt& s) {
     Call c;
@@ -91,11 +98,13 @@ Call read_call_row(Stmt& s) {
     c.duration_seconds = s.int_(7);
     c.audio_path = s.text(8);
     c.status = s.text(9);
+    c.manual_notes = s.text(10);
     return c;
 }
 constexpr const char* kCallColumns =
     "calls.id, calls.customer_id, customers.name, calls.meeting_name, calls.participants, "
-    "calls.started_at, calls.ended_at, calls.duration_seconds, calls.audio_path, calls.status ";
+    "calls.started_at, calls.ended_at, calls.duration_seconds, calls.audio_path, calls.status, "
+    "calls.manual_notes ";
 }  // namespace
 
 std::optional<Call> Repository::get_call(int64_t call_id) {

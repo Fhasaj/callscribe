@@ -67,6 +67,12 @@ TEST_CASE("call lifecycle, speaker-labeled segments, and note") {
     REQUIRE(note.has_value());
     CHECK(note->summary == "Discussed contract.");
 
+    CHECK(call->manual_notes.empty());
+    repo.update_manual_notes(call_id, "Remember to follow up on pricing.");
+    auto updated_call = repo.get_call(call_id);
+    REQUIRE(updated_call.has_value());
+    CHECK(updated_call->manual_notes == "Remember to follow up on pricing.");
+
     std::filesystem::remove_all(dir);
 }
 

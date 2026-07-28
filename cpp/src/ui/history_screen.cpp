@@ -39,6 +39,8 @@ void HistoryScreen::refresh_list() {
 }
 
 void HistoryScreen::load_detail() {
+    notes_ = (selected_ >= 0 && selected_ < static_cast<int>(calls_.size())) ? calls_[selected_].manual_notes : "";
+
     std::lock_guard<std::mutex> lock(detail_mutex_);
     if (selected_ < 0 || selected_ >= static_cast<int>(calls_.size())) {
         transcript_.clear();
@@ -51,6 +53,12 @@ void HistoryScreen::load_detail() {
     auto note = ctx_.repo->get_note_for_call(call.id);
     summary_ = note ? note->summary : "";
     email_ = note ? note->email_draft : "";
+}
+
+void HistoryScreen::save_current_notes() {
+    if (selected_ < 0 || selected_ >= static_cast<int>(calls_.size())) return;
+    calls_[selected_].manual_notes = notes_;
+    ctx_.repo->update_manual_notes(calls_[selected_].id, notes_);
 }
 
 void HistoryScreen::regenerate() {
@@ -116,22 +124,65 @@ void HistoryScreen::build_ui() {
         Container::Horizontal({search_input, search_button}),
         call_menu,
     });
-    auto right = Container::Vertical({regen_button, copy_summary_btn, copy_email_btn});
-    auto layout = Container::Horizontal({left, right});
 
-    root_ = Renderer(layout, [this, search_input, search_button, call_menu, regen_button, copy_summary_btn,
-                               copy_email_btn] {
-        std::string transcript_copy, summary_copy, email_copy, status_copy;
-        bool regen_in_progress;
+    auto transcript_page = Renderer([this] {
+        std::string transcript_copy;
         {
             std::lock_guard<std::mutex> lock(detail_mutex_);
             transcript_copy = transcript_;
-            summary_copy = summary_;
-            email_copy = email_;
-            status_copy = status_message_;
-            regen_in_progress = regenerating_;
         }
+        return frame(paragraph(transcript_copy.empty() ? "(select a call)" : transcript_copy)) | flex | border;
+    });
 
+    InputOption notes_opt;
+    notes_opt.multiline = true;
+    notes_opt.on_change = [this] { save_current_notes(); };
+    auto notes_input = Input(&notes_, "Add notes for this call...", notes_opt);
+    auto notes_page = Renderer(notes_input, [notes_input] { return notes_input->Render() | flex | border; });
+
+    auto summary_page = Renderer(Container::Vertical({regen_button, copy_summary_btn}),
+                                  [this, regen_button, copy_summary_btn] {
+                                      std::string summary_copy, status_copy;
+                                      bool regen_in_progress;
+                                      {
+                                          std::lock_guard<std::mutex> lock(detail_mutex_);
+                                          summary_copy = summary_;
+                                          status_copy = status_message_;
+                                          regen_in_progress = regenerating_;
+                                      }
+                                      Elements children;
+                                      children.push_back(paragraph(summary_copy.empty() ? "(no summary yet)"
+                                                                                         : summary_copy) |
+                                                          flex | border);
+                                      children.push_back(hbox({regen_button->Render(), text(" "),
+                                                                copy_summary_btn->Render()}));
+                                      if (regen_in_progress)
+                                          children.push_back(text("Working...") | color(Color(Color::Yellow)));
+                                      if (!status_copy.empty()) children.push_back(text(status_copy) | dim);
+                                      return vbox(children) | flex;
+                                  });
+
+    auto email_page = Renderer(copy_email_btn, [this, copy_email_btn] {
+        std::string email_copy;
+        {
+            std::lock_guard<std::mutex> lock(detail_mutex_);
+            email_copy = email_;
+        }
+        return vbox({
+                   paragraph(email_copy.empty() ? "(no email draft yet)" : email_copy) | flex | border,
+                   copy_email_btn->Render(),
+               }) |
+               flex;
+    });
+
+    auto inner_menu = Menu(&inner_tab_titles_, &inner_tab_index_, MenuOption::HorizontalAnimated());
+    auto inner_tab_container =
+        Container::Tab({transcript_page, notes_page, summary_page, email_page}, &inner_tab_index_);
+
+    auto right = Container::Vertical({inner_menu, inner_tab_container});
+    auto layout = Container::Horizontal({left, right});
+
+    root_ = Renderer(layout, [this, search_input, search_button, call_menu, inner_menu, inner_tab_container] {
         Element left_pane = vbox({
                                 hbox({search_input->Render() | flex, search_button->Render()}),
                                 separator(),
@@ -139,25 +190,12 @@ void HistoryScreen::build_ui() {
                             }) |
                             flex | size(WIDTH, LESS_THAN, 50);
 
-        Elements right_children;
-        right_children.push_back(text("Transcript:") | bold);
-        right_children.push_back(frame(paragraph(transcript_copy.empty() ? "(select a call)" : transcript_copy)) |
-                                  flex | border);
-        right_children.push_back(text("Summary:") | bold);
-        right_children.push_back(paragraph(summary_copy) | border);
-        right_children.push_back(text("Email draft:") | bold);
-        right_children.push_back(paragraph(email_copy) | border);
-        right_children.push_back(hbox({
-            regen_button->Render(),
-            text(" "),
-            copy_summary_btn->Render(),
-            text(" "),
-            copy_email_btn->Render(),
-        }));
-        if (regen_in_progress) right_children.push_back(text("Working...") | color(Color(Color::Yellow)));
-        if (!status_copy.empty()) right_children.push_back(text(status_copy) | dim);
-
-        Element right_pane = vbox(right_children) | flex;
+        Element right_pane = vbox({
+                                 inner_menu->Render(),
+                                 separator(),
+                                 inner_tab_container->Render() | flex,
+                             }) |
+                             flex;
 
         return hbox({left_pane, separator(), right_pane}) | flex;
     });

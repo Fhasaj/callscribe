@@ -33,6 +33,7 @@ private:
     std::string meeting_name_;
     std::string customer_name_;
     std::string participants_;
+    std::string manual_notes_;  // your own free-form notes for this call, saved as you type
 
     std::atomic<State> state_{State::Idle};
     std::chrono::steady_clock::time_point start_time_;
@@ -43,8 +44,8 @@ private:
     std::string email_draft_;
     std::string error_message_;
 
-    // Live/Summary/Email inner tab bar, below the meeting/customer form.
-    std::vector<std::string> inner_tab_titles_ = {"Live", "Summary", "Email"};
+    // Live/Notes/Summary/Email inner tab bar, below the meeting/customer form.
+    std::vector<std::string> inner_tab_titles_ = {"Live", "Notes", "Summary", "Email"};
     int inner_tab_index_ = 0;
 
     int64_t call_id_ = -1;

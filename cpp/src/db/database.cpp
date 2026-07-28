@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS calls (
     ended_at TEXT,
     duration_seconds INTEGER,
     audio_path TEXT,
-    status TEXT NOT NULL DEFAULT 'recording'
+    status TEXT NOT NULL DEFAULT 'recording',
+    manual_notes TEXT
 );
 
 CREATE TABLE IF NOT EXISTS transcript_segments (
@@ -83,6 +84,11 @@ Database::Database(const std::string& path) {
         sqlite3_close(db_);
         throw std::runtime_error("Failed to apply schema: " + msg);
     }
+
+    // Lightweight migration for DBs created before manual_notes existed --
+    // CREATE TABLE IF NOT EXISTS above is a no-op on an existing table, so
+    // add the column here; ignore the error if it's already present.
+    sqlite3_exec(db_, "ALTER TABLE calls ADD COLUMN manual_notes TEXT", nullptr, nullptr, nullptr);
 }
 
 Database::~Database() {

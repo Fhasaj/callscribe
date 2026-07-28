@@ -27,6 +27,7 @@ private:
     std::vector<db::Call> calls_;
     std::vector<std::string> call_labels_;
     int selected_ = 0;
+    std::string notes_;  // GUI-thread-only, bound directly to the notes Input
 
     std::mutex detail_mutex_;
     std::string transcript_;
@@ -36,10 +37,14 @@ private:
     bool regenerating_ = false;
     std::thread regen_thread_;
 
+    std::vector<std::string> inner_tab_titles_ = {"Transcript", "Notes", "Summary", "Email"};
+    int inner_tab_index_ = 0;
+
     ftxui::Component root_;
 
     void refresh_list();
     void load_detail();
+    void save_current_notes();
     void regenerate();
     void build_ui();
 };

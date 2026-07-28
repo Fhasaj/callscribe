@@ -27,6 +27,7 @@ struct Call {
     int duration_seconds = 0;
     std::string audio_path;
     std::string status;
+    std::string manual_notes;
 };
 
 struct TranscriptSegment {
@@ -84,6 +85,7 @@ public:
     void finish_call(int64_t call_id, int duration_seconds, const std::string& audio_path,
                       const std::string& status = "done");
     void set_call_status(int64_t call_id, const std::string& status);
+    void update_manual_notes(int64_t call_id, const std::string& notes);
     std::optional<Call> get_call(int64_t call_id);
     std::vector<Call> list_calls(const std::string& customer_name = "", const std::string& search = "");
     std::vector<TranscriptSegment> get_segments(int64_t call_id);

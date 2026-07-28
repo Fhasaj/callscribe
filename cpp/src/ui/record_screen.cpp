@@ -69,6 +69,14 @@ void RecordScreen::build_ui() {
         return frame(paragraph(transcript_copy.empty() ? "(nothing yet)" : transcript_copy)) | flex | border;
     });
 
+    InputOption notes_opt;
+    notes_opt.multiline = true;
+    notes_opt.on_change = [this] {
+        if (call_id_ >= 0) ctx_.repo->update_manual_notes(call_id_, manual_notes_);
+    };
+    auto notes_input = Input(&manual_notes_, "Type your own notes for this call here...", notes_opt);
+    auto notes_page = Renderer(notes_input, [notes_input] { return notes_input->Render() | flex | border; });
+
     auto summary_page = Renderer(copy_summary_btn, [this, copy_summary_btn] {
         std::string summary_copy;
         {
@@ -96,7 +104,7 @@ void RecordScreen::build_ui() {
     });
 
     auto inner_menu = Menu(&inner_tab_titles_, &inner_tab_index_, MenuOption::HorizontalAnimated());
-    auto inner_tab_container = Container::Tab({live_page, summary_page, email_page}, &inner_tab_index_);
+    auto inner_tab_container = Container::Tab({live_page, notes_page, summary_page, email_page}, &inner_tab_index_);
 
     auto form = Container::Vertical({
         meeting_input,
@@ -173,6 +181,7 @@ void RecordScreen::start_recording() {
         summary_text_.clear();
         email_draft_.clear();
     }
+    manual_notes_.clear();
 
     customer_id_ =
         customer_name_.empty() ? std::nullopt : std::optional<int64_t>(ctx_.repo->get_or_create_customer(customer_name_));
