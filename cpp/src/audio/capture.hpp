@@ -31,6 +31,10 @@ public:
 
     util::BlockingQueue<std::vector<float>>& chunks() { return chunk_queue_; }
 
+    // Live input level (RMS of the most recent ~100ms block, roughly 0..1),
+    // updated ~10x/second -- for driving a near-instant level gauge in the UI.
+    float current_level() const { return current_level_.load(); }
+
 private:
     std::string source_;
     pid_t pid_ = -1;
@@ -40,6 +44,8 @@ private:
     std::vector<float> full_audio_;
     std::vector<float> pending_;
     util::BlockingQueue<std::vector<float>> chunk_queue_;
+
+    std::atomic<float> current_level_{0.0f};
 
     void reader_loop();
 };

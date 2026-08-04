@@ -1,8 +1,10 @@
 #include "transcription/whisper_engine.hpp"
 
 #include <curl/curl.h>
+#include <ggml-backend.h>
 
 #include <algorithm>
+#include <system_error>
 #include <cstdio>
 #include <filesystem>
 #include <stdexcept>
@@ -61,12 +63,72 @@ void ensure_model_downloaded(const std::string& size) {
     std::filesystem::rename(tmp_path, path);
 }
 
+namespace {
+
+std::string format_mib(size_t bytes) { return std::to_string(bytes / (1024 * 1024)) + " MiB"; }
+
+struct GpuChoice {
+    bool any_gpu = false;   // a GPU backend exists at all
+    int device = -1;        // ordinal with room, or -1 if none
+    size_t best_free = 0;   // most free VRAM seen, for the message
+};
+
+// Weights are only part of it -- the KV cache, compute buffers and allocator
+// fragmentation all need room on top, so require a healthy margin over the
+// file size rather than just fitting the weights.
+//
+// First fit wins deliberately: CUDA enumerates fastest-first by default, so the
+// first device that has room is the best card that has room, and we only drop
+// to a slower one when the faster is full. (Note this ordering is the reverse
+// of nvidia-smi's, which numbers by PCI bus -- on a mixed pair, CUDA0 is not
+// necessarily nvidia-smi's GPU 0.) Picking the device with the most free memory
+// instead would sometimes land on the slower card.
+GpuChoice choose_gpu(size_t model_bytes) {
+    GpuChoice choice;
+    const size_t needed = model_bytes + model_bytes / 3 + (size_t{256} << 20);
+    int ordinal = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        choice.any_gpu = true;
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+        choice.best_free = std::max(choice.best_free, free_bytes);
+        if (free_bytes >= needed) {
+            choice.device = ordinal;
+            return choice;
+        }
+        ++ordinal;
+    }
+    return choice;
+}
+
+}  // namespace
+
 WhisperEngine::WhisperEngine(const std::string& model_path) {
     if (!std::filesystem::exists(model_path)) {
         throw std::runtime_error("Whisper model not found: " + model_path +
                                   " (run scripts/setup_env.sh or download it from Settings)");
     }
     whisper_context_params cparams = whisper_context_default_params();
+
+    std::error_code ec;
+    size_t model_bytes = static_cast<size_t>(std::filesystem::file_size(model_path, ec));
+    if (!ec && cparams.use_gpu) {
+        GpuChoice choice = choose_gpu(model_bytes);
+        if (choice.any_gpu && choice.device < 0) {
+            // Loading anyway would abort inside ggml and kill the process.
+            cparams.use_gpu = false;
+            backend_note_ = "Not enough free VRAM for the Whisper model (" + format_mib(model_bytes) +
+                            " model, " + format_mib(choice.best_free) +
+                            " free) -- transcribing on CPU, which is slower. Free some GPU memory "
+                            "(e.g. let Ollama unload) and restart to use the GPU.";
+        } else if (choice.device >= 0) {
+            cparams.gpu_device = choice.device;
+        }
+    }
+
     ctx_ = whisper_init_from_file_with_params(model_path.c_str(), cparams);
     if (!ctx_) {
         throw std::runtime_error("Failed to load Whisper model: " + model_path);

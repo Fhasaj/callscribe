@@ -1,6 +1,7 @@
 #pragma once
 #include "db/database.hpp"
 
+#include <array>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -67,6 +68,7 @@ struct YearlyStats {
     int tasks_completed = 0;
     std::vector<std::pair<std::string, int>> top_customers;
     std::vector<std::string> summaries;
+    std::array<int, 12> monthly_call_counts{};  // index 0 = January
 };
 
 // Thread-safe CRUD access to the SQLite DB. Plain parameterized SQL, no
@@ -99,6 +101,7 @@ public:
                       std::optional<int64_t> customer_id = std::nullopt, const std::string& due_date = "",
                       const std::string& source = "manual");
     std::vector<Task> list_tasks(const std::string& status = "", const std::string& customer_name = "");
+    std::vector<Task> list_tasks_for_call(int64_t call_id);
     void complete_task(int64_t task_id);
     void reopen_task(int64_t task_id);
     void delete_task(int64_t task_id);

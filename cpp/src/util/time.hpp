@@ -22,6 +22,20 @@ inline std::string today_iso() {
     return buf;
 }
 
+// today_iso() shifted by `days` (negative goes backward). Goes through
+// mktime() so month/year rollovers (e.g. "tomorrow" on the last day of the
+// month) are normalized automatically.
+inline std::string offset_days_iso(int days) {
+    std::time_t t = std::time(nullptr);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    tm.tm_mday += days;
+    std::mktime(&tm);
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm);
+    return buf;
+}
+
 inline std::string now_time_hhmm() {
     std::time_t t = std::time(nullptr);
     std::tm tm{};

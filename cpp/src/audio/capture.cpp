@@ -5,6 +5,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 
@@ -65,7 +66,11 @@ void StreamCapture::start() {
 }
 
 void StreamCapture::reader_loop() {
-    constexpr size_t block_samples = static_cast<size_t>(kSampleRate);  // 1s @ 16kHz
+    // 100ms read granularity -- small enough that current_level() feels
+    // instant in the UI, but still cheap at 16kHz mono. Whisper chunking
+    // (kChunkSeconds) is unaffected: samples still accumulate into
+    // pending_/full_audio_ regardless of how finely they arrive.
+    constexpr size_t block_samples = static_cast<size_t>(kSampleRate) / 10;
     constexpr size_t block_bytes = block_samples * sizeof(int16_t);
     const size_t chunk_target_samples = static_cast<size_t>(kSampleRate * kChunkSeconds);
 
@@ -83,6 +88,11 @@ void StreamCapture::reader_loop() {
         const int16_t* pcm = reinterpret_cast<const int16_t*>(buf.data());
         std::vector<float> samples(n_samples);
         for (size_t i = 0; i < n_samples; ++i) samples[i] = pcm[i] / 32768.0f;
+
+        double sum_sq = 0.0;
+        for (float s : samples) sum_sq += static_cast<double>(s) * s;
+        float rms = n_samples ? static_cast<float>(std::sqrt(sum_sq / static_cast<double>(n_samples))) : 0.0f;
+        current_level_.store(rms);
 
         full_audio_.insert(full_audio_.end(), samples.begin(), samples.end());
         pending_.insert(pending_.end(), samples.begin(), samples.end());

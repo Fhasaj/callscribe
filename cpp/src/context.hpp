@@ -34,6 +34,8 @@ public:
     bool whisper_ready() const;
     bool whisper_loading() const;
     std::string whisper_error() const;
+    // Non-fatal warning from model loading (e.g. fell back to CPU for lack of VRAM).
+    std::string whisper_notice() const;
     transcription::WhisperEngine* mic_engine();
     transcription::WhisperEngine* monitor_engine();
 
@@ -44,6 +46,7 @@ private:
     std::unique_ptr<transcription::WhisperEngine> mic_engine_;
     std::unique_ptr<transcription::WhisperEngine> monitor_engine_;
     std::string whisper_error_;
+    std::string whisper_notice_;
     bool whisper_loading_ = false;
     std::thread whisper_loader_thread_;
 };

@@ -251,6 +251,17 @@ std::vector<Task> Repository::list_tasks(const std::string& status, const std::s
     return out;
 }
 
+std::vector<Task> Repository::list_tasks_for_call(int64_t call_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_, std::string("SELECT ") + kTaskColumns +
+                    "FROM tasks LEFT JOIN customers ON customers.id = tasks.customer_id "
+                    "WHERE tasks.call_id = ? ORDER BY tasks.created_at");
+    s.bind(1, call_id);
+    std::vector<Task> out;
+    while (s.step()) out.push_back(read_task_row(s));
+    return out;
+}
+
 void Repository::complete_task(int64_t task_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     Stmt s(db_, "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?");
@@ -315,6 +326,16 @@ YearlyStats Repository::yearly_stats(int year) {
         Stmt s(db_, "SELECT COUNT(*) FROM tasks WHERE status = 'done' AND completed_at >= ? AND completed_at < ?");
         s.bind(1, start).bind(2, end);
         if (s.step()) stats.tasks_completed = s.int_(0);
+    }
+    {
+        Stmt s(db_,
+               "SELECT CAST(strftime('%m', started_at) AS INTEGER), COUNT(*) FROM calls "
+               "WHERE started_at >= ? AND started_at < ? GROUP BY 1");
+        s.bind(1, start).bind(2, end);
+        while (s.step()) {
+            int month = s.int_(0);  // 1-12
+            if (month >= 1 && month <= 12) stats.monthly_call_counts[static_cast<size_t>(month - 1)] = s.int_(1);
+        }
     }
     {
         Stmt s(db_,

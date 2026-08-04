@@ -73,13 +73,17 @@ add_library(callscribe_core STATIC
   src/context.cpp
   src/util/subprocess.cpp
   src/util/clipboard.cpp
+  src/util/virtual_pointer.cpp
   src/util/wav_writer.cpp
   src/util/date_format.cpp
   src/db/database.cpp
   src/db/repository.cpp
   src/audio/devices.cpp
+  src/audio/echo_cancel.cpp
   src/audio/capture.cpp
   src/transcription/whisper_engine.cpp
+  src/calendar/ics_parser.cpp
+  src/calendar/calendar_source.cpp
   src/llm/ollama_client.cpp
   src/llm/prompts.cpp
   src/llm/summarizer.cpp
@@ -98,11 +102,16 @@ target_link_libraries(callscribe_core PUBLIC
 add_executable(callscribe
   src/main.cpp
   src/ui/app.cpp
+  src/ui/scroll_pane.cpp
+  src/ui/text_wrap.cpp
+  src/ui/wrapped_input.cpp
   src/ui/record_screen.cpp
   src/ui/history_screen.cpp
+  src/ui/calendar_screen.cpp
   src/ui/tasks_screen.cpp
   src/ui/summary_screen.cpp
-  src/ui/proofread_screen.cpp
+  src/ui/chat_screen.cpp
+  src/ui/mouse_mover_screen.cpp
   src/ui/settings_screen.cpp
 )
 target_link_libraries(callscribe PRIVATE
@@ -125,8 +134,11 @@ if(CALLSCRIBE_BUILD_TESTS)
     tests/test_repository.cpp
     tests/test_prompts.cpp
     tests/test_date_format.cpp
+    tests/test_ics_parser.cpp
+    tests/test_text_wrap.cpp
+    src/ui/text_wrap.cpp
   )
-  target_link_libraries(callscribe_tests PRIVATE callscribe_core doctest::doctest)
+  target_link_libraries(callscribe_tests PRIVATE callscribe_core doctest::doctest ftxui::dom ftxui::screen)
 
   add_executable(integration_pipeline_test EXCLUDE_FROM_ALL
     tests/integration_pipeline_test.cpp

@@ -1,7 +1,9 @@
 #include "config.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <system_error>
 #include <nlohmann/json.hpp>
 
 namespace callscribe {
@@ -57,6 +59,26 @@ Settings load_settings() {
     if (j.contains("user_display_name")) s.user_display_name = j.at("user_display_name").get<std::string>();
     if (j.contains("reminder_time")) s.reminder_time = j.at("reminder_time").get<std::string>();
     if (j.contains("reminder_enabled")) s.reminder_enabled = j.at("reminder_enabled").get<bool>();
+    if (j.contains("echo_cancel")) s.echo_cancel = j.at("echo_cancel").get<bool>();
+    if (j.contains("mouse_mover_interval_seconds"))
+        s.mouse_mover_interval_seconds = j.at("mouse_mover_interval_seconds").get<int>();
+    if (j.contains("mouse_mover_pixels")) s.mouse_mover_pixels = j.at("mouse_mover_pixels").get<int>();
+    if (j.contains("mouse_mover_autostart")) s.mouse_mover_autostart = j.at("mouse_mover_autostart").get<bool>();
+    if (j.contains("calendar_source")) s.calendar_source = j.at("calendar_source").get<std::string>();
+    if (j.contains("calendar_ics_url")) s.calendar_ics_url = j.at("calendar_ics_url").get<std::string>();
+    if (j.contains("calendar_ics_path")) s.calendar_ics_path = j.at("calendar_ics_path").get<std::string>();
+    if (j.contains("calendar_refresh_minutes"))
+        s.calendar_refresh_minutes = std::max(5, j.at("calendar_refresh_minutes").get<int>());
+    // A blank preset would silently strip that section from the prompt, so fall
+    // back to the default rather than trusting an empty string.
+    auto load_prompt = [&j](const char* key, std::string& target) {
+        if (!j.contains(key) || !j.at(key).is_string()) return;
+        std::string v = j.at(key).get<std::string>();
+        if (!v.empty()) target = v;
+    };
+    load_prompt("summary_prompt", s.summary_prompt);
+    load_prompt("email_prompt", s.email_prompt);
+    load_prompt("tasks_prompt", s.tasks_prompt);
     return s;
 }
 
@@ -72,8 +94,27 @@ void save_settings(const Settings& s) {
     j["user_display_name"] = s.user_display_name;
     j["reminder_time"] = s.reminder_time;
     j["reminder_enabled"] = s.reminder_enabled;
+    j["echo_cancel"] = s.echo_cancel;
+    j["mouse_mover_interval_seconds"] = s.mouse_mover_interval_seconds;
+    j["mouse_mover_pixels"] = s.mouse_mover_pixels;
+    j["mouse_mover_autostart"] = s.mouse_mover_autostart;
+    j["calendar_source"] = s.calendar_source;
+    j["calendar_ics_url"] = s.calendar_ics_url;
+    j["calendar_ics_path"] = s.calendar_ics_path;
+    j["calendar_refresh_minutes"] = s.calendar_refresh_minutes;
+    j["summary_prompt"] = s.summary_prompt;
+    j["email_prompt"] = s.email_prompt;
+    j["tasks_prompt"] = s.tasks_prompt;
     std::ofstream out(config_file());
     out << j.dump(2);
+    out.close();
+    // A published-calendar URL is a bearer token for the whole calendar, so
+    // the file it lives in is kept owner-only rather than the 0644 an
+    // ofstream would otherwise leave behind.
+    std::error_code ec;
+    std::filesystem::permissions(config_file(),
+                                  std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                  std::filesystem::perm_options::replace, ec);
 }
 
 void ensure_data_dirs() {

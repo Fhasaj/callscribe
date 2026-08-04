@@ -2,6 +2,7 @@
 
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <mutex>
 
 namespace callscribe::llm {
@@ -66,6 +67,175 @@ std::string trim(const std::string& s) {
     if (start == std::string::npos) return "";
     size_t end = s.find_last_not_of(" \t\r\n");
     return s.substr(start, end - start + 1);
+}
+
+struct ChatStreamContext {
+    std::string buffer;
+    std::string content;
+    std::string thinking;
+    std::string error;
+    int prompt_eval_count = 0;
+    bool done = false;
+    const StreamCallback* on_progress = nullptr;
+};
+
+void consume_chat_line(ChatStreamContext* ctx, const std::string& line) {
+    if (line.empty()) return;
+    try {
+        nlohmann::json j = nlohmann::json::parse(line);
+        if (j.contains("error") && j.at("error").is_string()) {
+            ctx->error = j.at("error").get<std::string>();
+            return;
+        }
+        bool reasoning = false;
+        if (j.contains("message")) {
+            const auto& m = j.at("message");
+            if (m.contains("content") && m.at("content").is_string())
+                ctx->content += m.at("content").get<std::string>();
+            if (m.contains("thinking") && m.at("thinking").is_string()) {
+                const std::string chunk = m.at("thinking").get<std::string>();
+                ctx->thinking += chunk;
+                reasoning = !chunk.empty();
+            }
+        }
+        if (j.contains("prompt_eval_count") && j.at("prompt_eval_count").is_number())
+            ctx->prompt_eval_count = j.at("prompt_eval_count").get<int>();
+        if (j.value("done", false)) ctx->done = true;
+
+        if (ctx->on_progress && *ctx->on_progress) {
+            StreamProgress p;
+            p.content_chars = ctx->content.size();
+            p.thinking_chars = ctx->thinking.size();
+            p.reasoning = reasoning;
+            constexpr size_t kTailChars = 160;
+            p.thinking_tail = ctx->thinking.size() <= kTailChars
+                                  ? ctx->thinking
+                                  : ctx->thinking.substr(ctx->thinking.size() - kTailChars);
+            (*ctx->on_progress)(p);
+        }
+    } catch (const nlohmann::json::exception&) {
+        // Ignore a partial/malformed line and keep streaming.
+    }
+}
+
+// Models whose template doesn't use Ollama's `thinking` field emit the same
+// reasoning inline, fenced in <think>...</think> (qwen3, deepseek-r1 and
+// friends). Lift it out so both kinds of model reach the UI the same way.
+void extract_inline_thinking(std::string& content, std::string& thinking) {
+    static const std::string kOpen = "<think>";
+    static const std::string kClose = "</think>";
+    size_t open = content.find(kOpen);
+    while (open != std::string::npos) {
+        const size_t body = open + kOpen.size();
+        const size_t close = content.find(kClose, body);
+        // An unterminated block means the model was cut off mid-reasoning:
+        // take the rest as thinking rather than leaving the tag in the answer.
+        const size_t end = (close == std::string::npos) ? content.size() : close;
+        if (!thinking.empty()) thinking += "\n";
+        thinking += content.substr(body, end - body);
+        content.erase(open, (close == std::string::npos ? content.size() : close + kClose.size()) - open);
+        open = content.find(kOpen, open);
+    }
+}
+
+// Accumulates one streamed /api/chat chunk per line of NDJSON.
+size_t chat_write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* ctx = static_cast<ChatStreamContext*>(userdata);
+    ctx->buffer.append(ptr, size * nmemb);
+    size_t pos;
+    while ((pos = ctx->buffer.find('\n')) != std::string::npos) {
+        std::string line = ctx->buffer.substr(0, pos);
+        ctx->buffer.erase(0, pos + 1);
+        consume_chat_line(ctx, line);
+    }
+    return size * nmemb;
+}
+
+// Roughly how many tokens `text` is worth. English prose runs ~4 chars/token;
+// 3 is deliberately pessimistic so we size the context window up rather than
+// down -- undersizing means Ollama silently truncates the prompt.
+long estimate_tokens(const std::string& text) {
+    return static_cast<long>(text.size() / 3) + 1;
+}
+
+// Sends a single-turn chat request. Two things matter here:
+//
+// 1. /api/chat rather than /api/generate: harmony-style reasoning models
+//    (gpt-oss) emit their analysis channel into `response` on /api/generate, so
+//    the caller gets chain-of-thought instead of the answer. /api/chat applies
+//    the chat template and splits reasoning out into `message.thinking`.
+//
+// 2. Streaming rather than a single blocking POST. Ollama sends nothing at all
+//    while it evaluates a long prompt, so a non-streaming request looks like a
+//    dead connection and dies on a fixed timeout partway through a long call.
+//    Streaming keeps bytes flowing, which lets us drop the wall-clock deadline
+//    entirely and fail only on a connection that has genuinely stalled.
+ChatReply chat(const std::string& host, const std::string& model, const std::string& prompt, bool json_mode,
+               long num_ctx, const StreamCallback* on_progress) {
+    ensure_curl_global_init();
+    CurlHandle curl;
+
+    nlohmann::json req = {{"model", model},
+                          {"messages", nlohmann::json::array({{{"role", "user"}, {"content", prompt}}})},
+                          {"stream", true}};
+    if (json_mode) req["format"] = "json";
+    // Without an explicit num_ctx, Ollama applies its own small default and
+    // silently drops everything past it -- a long transcript comes back
+    // summarized from the handful of tokens that survived, with no error.
+    if (num_ctx > 0) req["options"] = {{"num_ctx", num_ctx}};
+    std::string body_str = req.dump();
+
+    ChatStreamContext ctx;
+    ctx.on_progress = on_progress;
+    curl_slist* headers = curl_slist_append(nullptr, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_URL, (host + "/api/chat").c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body_str.size()));
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, chat_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);  // no wall-clock cap on generation
+    // Prompt evaluation is silent, so allow a long quiet period before calling
+    // the connection dead; after that, <1 byte/s for 15 min is a real stall.
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 900L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
+    curl_slist_free_all(headers);
+
+    // Ollama's error replies are a bare {"error":...} object with no trailing
+    // newline, so the streaming loop above never sees them as a line. Flush
+    // whatever is left or the real reason is lost.
+    consume_chat_line(&ctx, trim(ctx.buffer));
+
+    if (res != CURLE_OK) {
+        std::string msg = std::string("Lost the connection to Ollama: ") + curl_easy_strerror(res);
+        if (!ctx.error.empty()) msg += " (" + ctx.error + ")";
+        throw OllamaError(msg);
+    }
+    if (!ctx.error.empty()) throw OllamaError("Ollama error: " + ctx.error);
+    if (http_status >= 400)
+        throw OllamaError("Ollama returned HTTP " + std::to_string(http_status) + ": " + ctx.buffer.substr(0, 300));
+    if (!ctx.done && trim(ctx.content).empty()) {
+        throw OllamaError(
+            "Ollama closed the stream without returning anything -- this usually means it ran out of "
+            "memory for the requested context size. Try a smaller model, or shorten the call.");
+    }
+
+    ChatReply reply;
+    reply.content = ctx.content;
+    reply.thinking = ctx.thinking;
+    extract_inline_thinking(reply.content, reply.thinking);
+    // A model that spends its whole budget reasoning can come back with empty
+    // content; the thinking text is better than nothing to parse/show.
+    if (trim(reply.content).empty()) reply.content = reply.thinking;
+    return reply;
 }
 
 struct PullContext {
@@ -153,18 +323,29 @@ void pull_model(const std::string& host, const std::string& model,
     if (!ctx.error.empty()) throw OllamaError("Failed to pull " + model + ": " + ctx.error);
 }
 
-nlohmann::json generate_json(const std::string& host, const std::string& model, const std::string& prompt,
-                              long timeout_seconds) {
-    nlohmann::json req = {{"model", model}, {"prompt", prompt}, {"stream", false}, {"format", "json"}};
-    std::string resp_body = http_post_json(host + "/api/generate", req.dump(), timeout_seconds);
+// Below kMinContext there is no point shrinking. kMaxContext is the ceiling we
+// will ask Ollama for: the KV cache is allocated for the whole window, so too
+// large a value makes generation fail outright on a mid-range GPU (Ollama drops
+// the connection rather than reporting anything useful). Anything longer than
+// this gets chunked by the summarizer instead.
+constexpr long kMinContext = 4096;
+constexpr long kMaxContext = 32768;
+constexpr long kOutputHeadroom = 2048;
 
-    nlohmann::json outer;
-    try {
-        outer = nlohmann::json::parse(resp_body);
-    } catch (const nlohmann::json::exception& e) {
-        throw OllamaError(std::string("Ollama returned an invalid response envelope: ") + e.what());
-    }
-    std::string raw = outer.value("response", "");
+long context_size_for(const std::string& prompt) {
+    // Prompt tokens plus room for the answer, clamped to that range.
+    long needed = estimate_tokens(prompt) + kOutputHeadroom;
+    return std::clamp(needed, kMinContext, kMaxContext);
+}
+
+long max_prompt_chars() {
+    // The largest prompt that fits kMaxContext at the estimate_tokens ratio,
+    // used by the summarizer to decide when a transcript needs chunking.
+    return (kMaxContext - kOutputHeadroom) * 3;
+}
+
+nlohmann::json generate_json(const std::string& host, const std::string& model, const std::string& prompt) {
+    std::string raw = chat(host, model, prompt, /*json_mode=*/true, context_size_for(prompt), nullptr).content;
     try {
         return nlohmann::json::parse(raw);
     } catch (const nlohmann::json::exception&) {
@@ -181,17 +362,17 @@ nlohmann::json generate_json(const std::string& host, const std::string& model, 
     }
 }
 
-std::string generate_text(const std::string& host, const std::string& model, const std::string& prompt,
-                           long timeout_seconds) {
-    nlohmann::json req = {{"model", model}, {"prompt", prompt}, {"stream", false}};
-    std::string resp_body = http_post_json(host + "/api/generate", req.dump(), timeout_seconds);
-    nlohmann::json outer;
-    try {
-        outer = nlohmann::json::parse(resp_body);
-    } catch (const nlohmann::json::exception& e) {
-        throw OllamaError(std::string("Ollama returned an invalid response envelope: ") + e.what());
-    }
-    return trim(outer.value("response", ""));
+std::string generate_text(const std::string& host, const std::string& model, const std::string& prompt) {
+    return trim(chat(host, model, prompt, /*json_mode=*/false, context_size_for(prompt), nullptr).content);
+}
+
+ChatReply generate_reply(const std::string& host, const std::string& model, const std::string& prompt,
+                          const StreamCallback& on_progress) {
+    ChatReply reply = chat(host, model, prompt, /*json_mode=*/false, context_size_for(prompt),
+                           on_progress ? &on_progress : nullptr);
+    reply.content = trim(reply.content);
+    reply.thinking = trim(reply.thinking);
+    return reply;
 }
 
 }  // namespace callscribe::llm

@@ -5,6 +5,10 @@
 #include <algorithm>
 
 #include "llm/summarizer.hpp"
+#include "ui/scroll_pane.hpp"
+#include "ui/styled_input.hpp"
+#include "ui/theme.hpp"
+#include "ui/wrapped_input.hpp"
 #include "util/clipboard.hpp"
 #include "util/date_format.hpp"
 
@@ -40,6 +44,7 @@ void HistoryScreen::refresh_list() {
 
 void HistoryScreen::load_detail() {
     notes_ = (selected_ >= 0 && selected_ < static_cast<int>(calls_.size())) ? calls_[selected_].manual_notes : "";
+    linked_tasks_dirty_ = true;
 
     std::lock_guard<std::mutex> lock(detail_mutex_);
     if (selected_ < 0 || selected_ >= static_cast<int>(calls_.size())) {
@@ -53,6 +58,21 @@ void HistoryScreen::load_detail() {
     auto note = ctx_.repo->get_note_for_call(call.id);
     summary_ = note ? note->summary : "";
     email_ = note ? note->email_draft : "";
+}
+
+void HistoryScreen::refresh_linked_tasks() {
+    linked_tasks_ = (selected_ >= 0 && selected_ < static_cast<int>(calls_.size()))
+                        ? ctx_.repo->list_tasks_for_call(calls_[selected_].id)
+                        : std::vector<db::Task>{};
+    linked_tasks_dirty_ = false;
+}
+
+void HistoryScreen::add_task_for_selected() {
+    if (new_task_text_.empty() || selected_ < 0 || selected_ >= static_cast<int>(calls_.size())) return;
+    const auto& call = calls_[selected_];
+    ctx_.repo->add_task(new_task_text_, call.id, call.customer_id, "", "manual");
+    new_task_text_.clear();
+    linked_tasks_dirty_ = true;
 }
 
 void HistoryScreen::save_current_notes() {
@@ -81,13 +101,24 @@ void HistoryScreen::regenerate() {
         try {
             auto result = llm::summarize_call(ctx_.settings.ollama_host, model, transcript, call.customer_name,
                                                call.meeting_name, call.participants,
-                                               util::iso_date_to_display(call.started_at.substr(0, 10)));
+                                               util::iso_date_to_display(call.started_at.substr(0, 10)),
+                                               [this](const std::string& phase) {
+                                                   std::lock_guard<std::mutex> lock(detail_mutex_);
+                                                   status_message_ = phase;
+                                               },
+                                               llm::PromptPresets{ctx_.settings.summary_prompt,
+                                                                  ctx_.settings.email_prompt,
+                                                                  ctx_.settings.tasks_prompt});
             for (auto& t : result.tasks) ctx_.repo->add_task(t, call.id, call.customer_id, "", "call");
+            linked_tasks_dirty_ = true;
             ctx_.repo->add_note(call.id, result.summary_text, result.email_draft, "[]");
             std::lock_guard<std::mutex> lock(detail_mutex_);
             summary_ = result.summary_text;
             email_ = result.email_draft;
-            status_message_ = "Done.";
+            // Don't report plain success behind an empty pane -- say why it's blank.
+            status_message_ = result.summary_text.empty()
+                                  ? "Done, but the model returned no summary points for this call."
+                                  : "Done.";
             regenerating_ = false;
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(detail_mutex_);
@@ -100,17 +131,22 @@ void HistoryScreen::regenerate() {
 void HistoryScreen::build_ui() {
     using namespace ftxui;
 
-    InputOption search_opt;
+    InputOption search_opt = styled_input_option();
     search_opt.multiline = false;
     search_opt.on_enter = [this] { refresh_list(); };
-    auto search_input = Input(&search_text_, "Search transcript or customer...", search_opt);
-    auto search_button = Button("Search", [this] { refresh_list(); });
+    auto search_input = WrappedInput(&search_text_, "Search transcript or customer...", search_opt);
+    auto search_button = Button("Search", [this] { refresh_list(); }, ButtonOption::Animated(theme::kAccent));
 
     MenuOption menu_opt = MenuOption::Vertical();
     menu_opt.on_change = [this] { load_detail(); };
     auto call_menu = Menu(&call_labels_, &selected_, menu_opt);
 
-    auto regen_button = Button("Re-generate summary", [this] { regenerate(); });
+    auto regen_button =
+        Button("Re-generate summary", [this] { regenerate(); }, ButtonOption::Animated(theme::kAccent));
+    auto copy_transcript_btn = Button("Copy Transcript", [this] {
+        std::lock_guard<std::mutex> lock(detail_mutex_);
+        util::copy_to_clipboard(transcript_);
+    });
     auto copy_summary_btn = Button("Copy Summary", [this] {
         std::lock_guard<std::mutex> lock(detail_mutex_);
         util::copy_to_clipboard(summary_);
@@ -125,51 +161,99 @@ void HistoryScreen::build_ui() {
         call_menu,
     });
 
-    auto transcript_page = Renderer([this] {
-        std::string transcript_copy;
-        {
+    auto transcript_pane = ScrollableText(
+        [this] {
             std::lock_guard<std::mutex> lock(detail_mutex_);
-            transcript_copy = transcript_;
-        }
-        return frame(paragraph(transcript_copy.empty() ? "(select a call)" : transcript_copy)) | flex | border;
-    });
+            return transcript_;
+        },
+        "(select a call)");
+    auto transcript_page =
+        Renderer(Container::Vertical({transcript_pane, copy_transcript_btn}),
+                 [transcript_pane, copy_transcript_btn] {
+                     return vbox({transcript_pane->Render() | flex, copy_transcript_btn->Render()}) | flex;
+                 });
 
     InputOption notes_opt;
     notes_opt.multiline = true;
     notes_opt.on_change = [this] { save_current_notes(); };
-    auto notes_input = Input(&notes_, "Add notes for this call...", notes_opt);
-    auto notes_page = Renderer(notes_input, [notes_input] { return notes_input->Render() | flex | border; });
+    auto notes_input = WrappedInput(&notes_, "Add notes for this call...", notes_opt);
+    // An editable Input consumes clicks to place its cursor, so its text can't
+    // be drag-selected the way the read-only panes can -- hence a copy button.
+    auto copy_notes_btn = Button("Copy Notes", [this] {
+        std::lock_guard<std::mutex> lock(detail_mutex_);
+        util::copy_to_clipboard(notes_);
+    });
+    auto notes_page = Renderer(Container::Vertical({notes_input, copy_notes_btn}),
+                               [notes_input, copy_notes_btn] {
+                                   return vbox({
+                                              notes_input->Render() | flex | borderStyled(ROUNDED, theme::kMuted),
+                                              copy_notes_btn->Render(),
+                                          }) |
+                                          flex;
+                               });
 
-    auto summary_page = Renderer(Container::Vertical({regen_button, copy_summary_btn}),
-                                  [this, regen_button, copy_summary_btn] {
-                                      std::string summary_copy, status_copy;
-                                      bool regen_in_progress;
-                                      {
-                                          std::lock_guard<std::mutex> lock(detail_mutex_);
-                                          summary_copy = summary_;
-                                          status_copy = status_message_;
-                                          regen_in_progress = regenerating_;
-                                      }
-                                      Elements children;
-                                      children.push_back(paragraph(summary_copy.empty() ? "(no summary yet)"
-                                                                                         : summary_copy) |
-                                                          flex | border);
-                                      children.push_back(hbox({regen_button->Render(), text(" "),
-                                                                copy_summary_btn->Render()}));
-                                      if (regen_in_progress)
-                                          children.push_back(text("Working...") | color(Color(Color::Yellow)));
-                                      if (!status_copy.empty()) children.push_back(text(status_copy) | dim);
-                                      return vbox(children) | flex;
-                                  });
+    InputOption new_task_opt = styled_input_option();
+    new_task_opt.multiline = false;
+    new_task_opt.on_enter = [this] { add_task_for_selected(); };
+    auto new_task_input = WrappedInput(&new_task_text_, "Add a task for this call...", new_task_opt);
+    auto add_task_btn =
+        Button("Add Task", [this] { add_task_for_selected(); }, ButtonOption::Animated(theme::kAccent));
 
-    auto email_page = Renderer(copy_email_btn, [this, copy_email_btn] {
-        std::string email_copy;
-        {
+    auto summary_pane = ScrollableText(
+        [this] {
             std::lock_guard<std::mutex> lock(detail_mutex_);
-            email_copy = email_;
-        }
+            return summary_;
+        },
+        "(no summary yet)");
+
+    auto summary_page =
+        Renderer(Container::Vertical({summary_pane, regen_button, copy_summary_btn, new_task_input, add_task_btn}),
+                 [this, summary_pane, regen_button, copy_summary_btn, new_task_input, add_task_btn] {
+                     if (linked_tasks_dirty_.load()) refresh_linked_tasks();
+
+                     std::string status_copy;
+                     bool regen_in_progress;
+                     {
+                         std::lock_guard<std::mutex> lock(detail_mutex_);
+                         status_copy = status_message_;
+                         regen_in_progress = regenerating_;
+                     }
+                     Elements children;
+                     children.push_back(summary_pane->Render() | flex);
+                     children.push_back(
+                         hbox({regen_button->Render(), text(" "), copy_summary_btn->Render()}));
+                     if (regen_in_progress) children.push_back(text("Working...") | color(theme::kWarning));
+                     if (!status_copy.empty()) children.push_back(text(status_copy) | dim);
+
+                     Elements task_lines;
+                     for (auto& t : linked_tasks_) {
+                         bool done = t.status == "done";
+                         std::string line = (done ? "[x] " : "[ ] ") + t.description;
+                         if (t.source == "call") line += "  [auto]";
+                         Element e = text(line);
+                         if (done) e |= color(theme::kMuted);
+                         task_lines.push_back(e);
+                     }
+                     if (task_lines.empty()) task_lines.push_back(text("(no tasks linked to this call yet)") | dim);
+
+                     children.push_back(separator() | color(theme::kMuted));
+                     children.push_back(text("Tasks for this call") | bold | color(theme::kAccent));
+                     children.push_back(vbox(task_lines));
+                     children.push_back(
+                         hbox({new_task_input->Render() | flex, text(" "), add_task_btn->Render()}));
+
+                     return vbox(children) | flex;
+                 });
+
+    auto email_pane = ScrollableText(
+        [this] {
+            std::lock_guard<std::mutex> lock(detail_mutex_);
+            return email_;
+        },
+        "(no email draft yet)");
+    auto email_page = Renderer(Container::Vertical({email_pane, copy_email_btn}), [email_pane, copy_email_btn] {
         return vbox({
-                   paragraph(email_copy.empty() ? "(no email draft yet)" : email_copy) | flex | border,
+                   email_pane->Render() | flex,
                    copy_email_btn->Render(),
                }) |
                flex;
@@ -185,19 +269,19 @@ void HistoryScreen::build_ui() {
     root_ = Renderer(layout, [this, search_input, search_button, call_menu, inner_menu, inner_tab_container] {
         Element left_pane = vbox({
                                 hbox({search_input->Render() | flex, search_button->Render()}),
-                                separator(),
+                                separator() | color(theme::kMuted),
                                 call_menu->Render() | frame | flex,
                             }) |
                             flex | size(WIDTH, LESS_THAN, 50);
 
         Element right_pane = vbox({
                                  inner_menu->Render(),
-                                 separator(),
+                                 separator() | color(theme::kMuted),
                                  inner_tab_container->Render() | flex,
                              }) |
                              flex;
 
-        return hbox({left_pane, separator(), right_pane}) | flex;
+        return hbox({left_pane, separator() | color(theme::kMuted), right_pane}) | flex;
     });
 }
 

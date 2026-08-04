@@ -20,6 +20,7 @@ void AppContext::preload_whisper() {
         if (mic_engine_ || whisper_loading_) return;
         whisper_loading_ = true;
         whisper_error_.clear();
+        whisper_notice_.clear();
     }
     if (whisper_loader_thread_.joinable()) whisper_loader_thread_.join();
 
@@ -31,9 +32,11 @@ void AppContext::preload_whisper() {
         try {
             auto mic = std::make_unique<transcription::WhisperEngine>(model_path);
             auto monitor = std::make_unique<transcription::WhisperEngine>(model_path);
+            std::string note = mic->backend_note().empty() ? monitor->backend_note() : mic->backend_note();
             std::lock_guard<std::mutex> lock(whisper_mutex_);
             mic_engine_ = std::move(mic);
             monitor_engine_ = std::move(monitor);
+            whisper_notice_ = note;
             whisper_loading_ = false;
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(whisper_mutex_);
@@ -65,6 +68,11 @@ bool AppContext::whisper_loading() const {
 std::string AppContext::whisper_error() const {
     std::lock_guard<std::mutex> lock(whisper_mutex_);
     return whisper_error_;
+}
+
+std::string AppContext::whisper_notice() const {
+    std::lock_guard<std::mutex> lock(whisper_mutex_);
+    return whisper_notice_;
 }
 
 transcription::WhisperEngine* AppContext::mic_engine() {

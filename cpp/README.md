@@ -76,6 +76,9 @@ Go to the **Settings** screen and:
   re-generate a summary.
 - **Tasks** -- manual + call-extracted tasks, checkable, with a daily
   desktop notification for what's open.
+- **Calendar** -- a read-only agenda imported from your Teams/Outlook
+  calendar (Today / Next 7 days / This month). No Microsoft sign-in:
+  see [Importing your calendar](#importing-your-calendar) below.
 - **Yearly Summary** -- stats for a chosen year plus an optional
   LLM-written prose recap.
 - **Proofread** -- a small chat: paste or type an email, press Send,
@@ -87,6 +90,47 @@ Go to the **Settings** screen and:
 Tab between screens with the top menu (arrow keys / mouse). Within a
 screen, Tab/Shift+Tab moves between fields; Enter/click activates
 buttons.
+
+## Importing your calendar
+
+The Calendar tab reads your calendar without signing in to a Microsoft
+account -- there's no OAuth, no Graph API, no token. Two ways in, both
+read-only; pick one under **Setup** on the Calendar tab.
+
+**1. Published ICS feed (stays in sync).** In Outlook on the web:
+Settings -> Calendar -> Shared calendars -> *Publish a calendar* ->
+choose your calendar, permission **"Can view all details"** -> Publish.
+Copy the `.ics` link (not the HTML one) and paste it into Setup. The
+app re-downloads it on a timer (default every 30 minutes).
+
+Two caveats worth knowing:
+
+- Many corporate tenants **disable calendar publishing** by policy. If
+  the Publish option is missing or greyed out, use option 2.
+- Microsoft regenerates the published feed lazily -- changes can take
+  a few hours to appear. It is not a live view.
+
+The feed URL is a **bearer secret**: anyone who has it can read your
+calendar without authenticating. It's stored in
+`~/.config/callscribe-cpp/config.json`, which CallScribe now writes
+`0600` (owner-only). Revoke it from the same Outlook page if it leaks.
+
+**2. Local `.ics` file (always works).** Outlook desktop -> File ->
+Save Calendar -> iCalendar format, or save any single meeting invite
+(`.ics` attachment). Point Setup at the file path. Re-export whenever
+you want fresh data -- the app re-reads the file on the same timer.
+
+Either way, the last successfully read feed is cached at
+`~/.local/share/callscribe-cpp/calendar-cache.ics`, so the agenda still
+renders when you're offline or the link is temporarily failing; the
+status line says when it's showing a stale copy and why.
+
+Recurring meetings are expanded locally (daily/weekly/monthly/yearly
+rules with `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTHDAY`,
+`BYMONTH`), including `EXDATE` skips and single occurrences the
+organizer moved or cancelled. Times honor the invite's own time zone
+via the system tz database, so a 09:00 weekly meeting stays at 09:00
+across daylight-saving changes.
 
 ## A note on call recording
 
@@ -113,10 +157,15 @@ src/
                               use across threads on one context
   llm/                        libcurl-based Ollama client, prompts, and
                                summarization/proofreading orchestration
+  calendar/                    iCalendar reader: RFC 5545 parsing +
+                                recurrence expansion, and the ICS
+                                 source (published URL / local file)
+                                  with an offline cache
   tasks/                       daily reminder scheduler (background
                                 thread + notify-send)
   ui/                           FTXUI screens: Record, History, Tasks,
-                                 Yearly Summary, Proofread, Settings
+                                 Calendar, Yearly Summary, Proofread,
+                                  Settings
   util/                          small helpers: blocking queue, clipboard
                                   (wl-copy/xclip/xsel), WAV writer,
                                   subprocess capture, time formatting
@@ -137,7 +186,10 @@ tradeoff given whisper.cpp's efficiency.
 cmake --build build --target callscribe_tests && ./build/callscribe_tests
 ```
 
-Unit tests (doctest) cover the DB repository and prompt builders.
+Unit tests (doctest) cover the DB repository, prompt builders, date
+formatting, text wrapping, and the iCalendar parser (folding, escaping,
+Windows time zone mapping, recurrence expansion, EXDATE/RECURRENCE-ID,
+all-day events, and DST-safe repeats).
 
 ```bash
 cmake --build build --target integration_pipeline_test && ./build/integration_pipeline_test
@@ -156,7 +208,9 @@ running.
   end -- there's only one loopback audio channel to work with.
 - No Teams API integration -- audio is captured via system loopback, so
   it works with the Teams desktop app, the Teams PWA, or any other call
-  in a browser tab.
+  in a browser tab. The Calendar tab is likewise read-only ICS import,
+  not a Microsoft Graph client: you can view your agenda, not create or
+  respond to invites.
 - No automatic cross-machine sync of the database -- point the DB path
   (Settings) at a synced folder yourself if you want notes shared
   between machines.
