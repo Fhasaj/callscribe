@@ -1,6 +1,25 @@
-.venv/
-__pycache__/
-*.pyc
+# Build output
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+_deps/
+*.o
+*.a
+*.so
+
+# Editor / tooling
+.cache/
+.idea/
+.vscode/
+*.swp
+
+# Local data (databases, recordings, Whisper models)
 data/
 *.db
+*.db-wal
+*.db-shm
 *.wav
+*.bin
