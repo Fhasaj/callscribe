@@ -30,8 +30,25 @@ std::string build_summary_prompt(const std::string& transcript, const std::strin
     out << "- \"customer_email\": a single plain-text string. " << email_text
         << " Separate paragraphs with a blank line, but write each paragraph as one continuous "
            "line -- do not hard-wrap it to a fixed column width.\n";
-    out << "- \"tasks\": an array of short strings. " << tasks_text
-        << " Use an empty array if there are none.\n\n";
+    out << "- \"tasks\": an array of objects, ONE OBJECT PER TASK. " << tasks_text
+        << " Each object has exactly these keys:\n"
+           "    * \"description\": the action itself, one short imperative sentence (e.g. \"Send the "
+           "updated pricing sheet\"). One action per object -- never combine several actions into "
+           "one description.\n"
+           "    * \"due_date\": the date the task is due as \"YYYY-MM-DD\". Resolve anything said "
+           "relative to the call (\"tomorrow\", \"next Friday\", \"end of the week\") against the "
+           "call date above. Use \"\" if no date was mentioned or implied -- do not guess.\n"
+           "    * \"priority\": exactly one of \"low\", \"medium\", \"high\". Use \"high\" for "
+           "anything urgent, promised for today/tomorrow, or blocking someone; \"low\" for "
+           "nice-to-haves with no deadline; \"medium\" otherwise.\n"
+           "    * \"customer\": the customer or company the task is for. Default to the customer "
+           "named above unless the task is clearly for a different one mentioned in the call.\n"
+           "  Use an empty array if there are no tasks. Do NOT return the tasks as a markdown "
+           "table, as a numbered list, or as one long string -- the value must be a JSON array of "
+           "objects.\n\n";
+    out << "Example of the tasks value:\n"
+           "  \"tasks\": [{\"description\": \"Send the updated pricing sheet\", \"due_date\": "
+           "\"2026-07-30\", \"priority\": \"high\", \"customer\": \"Acme Corp\"}]\n\n";
     out << "If the transcript has no real content, still return valid JSON with empty/minimal values.\n";
     return out.str();
 }

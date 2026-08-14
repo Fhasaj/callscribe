@@ -29,6 +29,10 @@ private:
     std::vector<std::string> call_labels_;
     int selected_ = 0;
     std::string notes_;  // GUI-thread-only, bound directly to the notes Input
+    // Last repository revision the list was built from; when it moves (a call
+    // finished summarizing on the Record tab, say) the list and the open call
+    // are reloaded, with the selection kept on the same call id.
+    uint64_t seen_revision_ = 0;
 
     std::mutex detail_mutex_;
     std::string transcript_;

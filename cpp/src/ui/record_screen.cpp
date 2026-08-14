@@ -11,6 +11,7 @@
 #include "ui/level_meter.hpp"
 #include "ui/scroll_pane.hpp"
 #include "ui/styled_input.hpp"
+#include "ui/task_meta.hpp"
 #include "ui/theme.hpp"
 #include "ui/wrapped_input.hpp"
 #include "util/clipboard.hpp"
@@ -33,7 +34,7 @@ std::string format_mmss(long long total_seconds) {
 RecordScreen::RecordScreen(AppContext& ctx) : ctx_(ctx) { build_ui(); }
 
 RecordScreen::~RecordScreen() {
-    if (state_.load() == State::Recording) stop_recording();
+    if (is_recording()) stop_recording();
     if (finalize_worker_.joinable()) finalize_worker_.join();
     if (mic_worker_.joinable()) mic_worker_.join();
     if (monitor_worker_.joinable()) monitor_worker_.join();
@@ -54,10 +55,21 @@ void RecordScreen::build_ui() {
         [this] {
             if (state_.load() == State::Idle)
                 start_recording();
-            else if (state_.load() == State::Recording)
+            else if (is_recording())
                 stop_recording();
         },
         ButtonOption::Animated(theme::kAccent));
+
+    // Label follows the state so the button says what it will do next.
+    ButtonOption pause_opt = ButtonOption::Animated(theme::kWarning);
+    pause_opt.transform = [this](const EntryState& s) {
+        Element e = text(state_.load() == State::Paused ? " ▶ Resume " : " ❚❚ Pause ") | bold;
+        e |= state_.load() == State::Paused ? color(theme::kSuccess) : color(theme::kWarning);
+        if (s.focused) e |= inverted;
+        return e;
+    };
+    auto pause_button = Button("Pause", [this] { toggle_pause(); }, pause_opt);
+    auto pause_slot = Maybe(pause_button, [this] { return is_recording(); });
 
     auto copy_summary_btn = Button("Copy Summary", [this] {
         std::lock_guard<std::mutex> lock(text_mutex_);
@@ -117,7 +129,8 @@ void RecordScreen::build_ui() {
     auto summary_page =
         Renderer(Container::Vertical({summary_pane, copy_summary_btn, new_task_input, add_task_btn}),
                  [this, summary_pane, copy_summary_btn, new_task_input, add_task_btn] {
-                     if (linked_tasks_dirty_.load()) refresh_linked_tasks();
+                     if (linked_tasks_dirty_.load() || ctx_.repo->revision() != seen_revision_)
+                         refresh_linked_tasks();
 
                      Elements task_lines;
                      for (auto& t : linked_tasks_) {
@@ -127,6 +140,7 @@ void RecordScreen::build_ui() {
                          Element e = text(line);
                          if (done) e |= color(theme::kMuted);
                          task_lines.push_back(e);
+                         task_lines.push_back(text("    " + task_meta_line(t)) | color(theme::kMuted));
                      }
                      if (task_lines.empty()) task_lines.push_back(text("(no tasks linked to this call yet)") | dim);
 
@@ -162,28 +176,24 @@ void RecordScreen::build_ui() {
         meeting_input,
         customer_input,
         participants_input,
-        start_stop_button,
+        Container::Horizontal({start_stop_button, pause_slot}),
         inner_menu,
         inner_tab_container,
     });
 
-    root_ = Renderer(form, [this, meeting_input, customer_input, participants_input, start_stop_button, inner_menu,
-                             inner_tab_container] {
+    root_ = Renderer(form, [this, meeting_input, customer_input, participants_input, start_stop_button, pause_slot,
+                             inner_menu, inner_tab_container] {
         State state = state_.load();
         std::string status_text = state == State::Idle    ? "Idle"
                                    : state == State::Recording ? "Recording..."
+                                   : state == State::Paused    ? "Paused -- audio is not being captured"
                                                                 : "Transcribing & summarizing...";
         Color status_color = state == State::Recording  ? theme::kDanger
+                              : state == State::Paused     ? theme::kWarning
                               : state == State::Processing ? theme::kWarning
                                                             : theme::kSuccess;
 
-        std::string elapsed_text = "00:00";
-        if (state == State::Recording) {
-            auto secs = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
-                                                                           start_time_)
-                            .count();
-            elapsed_text = format_mmss(secs);
-        }
+        std::string elapsed_text = state == State::Idle ? "00:00" : format_mmss(elapsed_seconds());
 
         std::string error_copy, detail_copy;
         {
@@ -200,8 +210,14 @@ void RecordScreen::build_ui() {
         children.push_back(hbox({text("Meeting:      "), meeting_input->Render() | flex}));
         children.push_back(hbox({text("Customer:     "), customer_input->Render() | flex}));
         children.push_back(hbox({text("Participants: "), participants_input->Render() | flex}));
-        Elements status_row = {start_stop_button->Render(), text("   ")};
+        Elements status_row = {start_stop_button->Render()};
+        if (is_recording()) {
+            status_row.push_back(text(" "));
+            status_row.push_back(pause_slot->Render());
+        }
+        status_row.push_back(text("   "));
         if (state == State::Recording) status_row.push_back(text("● REC ") | bold | color(theme::kDanger));
+        if (state == State::Paused) status_row.push_back(text("❚❚ PAUSED ") | bold | color(theme::kWarning));
         status_row.push_back(text(status_text) | color(status_color));
         status_row.push_back(filler());
         status_row.push_back(text(elapsed_text) | color(status_color) | (state == State::Recording ? bold : nothing));
@@ -214,7 +230,7 @@ void RecordScreen::build_ui() {
         if (std::string wn = ctx_.whisper_notice(); !wn.empty())
             children.push_back(paragraph(wn) | color(theme::kWarning));
 
-        if (state == State::Recording) {
+        if (is_recording()) {
             children.push_back(hbox({text("Mic:  ") | dim,
                                       gauge(level_to_progress(mic_capture_->current_level())) |
                                           color(theme::kDanger) | flex}));
@@ -304,7 +320,34 @@ void RecordScreen::start_recording() {
     monitor_worker_ = std::thread(&RecordScreen::monitor_worker_loop, this);
 
     start_time_ = std::chrono::steady_clock::now();
+    recorded_seconds_ = 0;
     state_.store(State::Recording);
+}
+
+long long RecordScreen::elapsed_seconds() const {
+    long long live = 0;
+    if (state_.load() == State::Recording) {
+        live = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time_)
+                   .count();
+    }
+    return recorded_seconds_ + live;
+}
+
+void RecordScreen::toggle_pause() {
+    State state = state_.load();
+    if (state == State::Recording) {
+        // Bank the stretch just recorded, then let the capture threads drop
+        // whatever arrives until the resume.
+        recorded_seconds_ = elapsed_seconds();
+        if (mic_capture_) mic_capture_->set_paused(true);
+        if (monitor_capture_) monitor_capture_->set_paused(true);
+        state_.store(State::Paused);
+    } else if (state == State::Paused) {
+        start_time_ = std::chrono::steady_clock::now();
+        if (mic_capture_) mic_capture_->set_paused(false);
+        if (monitor_capture_) monitor_capture_->set_paused(false);
+        state_.store(State::Recording);
+    }
 }
 
 void RecordScreen::mic_worker_loop() {
@@ -333,6 +376,7 @@ void RecordScreen::monitor_worker_loop() {
 }
 
 void RecordScreen::refresh_linked_tasks() {
+    seen_revision_ = ctx_.repo->revision();
     linked_tasks_ = call_id_ >= 0 ? ctx_.repo->list_tasks_for_call(call_id_) : std::vector<db::Task>{};
     linked_tasks_dirty_ = false;
 }
@@ -351,7 +395,12 @@ void RecordScreen::append_transcript_line(const std::string& speaker, const std:
 }
 
 void RecordScreen::stop_recording() {
-    if (state_.load() != State::Recording) return;
+    if (!is_recording()) return;
+    // Freeze the clock before the state flips, so a call stopped while paused
+    // still reports the time that was actually recorded.
+    recorded_seconds_ = elapsed_seconds();
+    if (mic_capture_) mic_capture_->set_paused(false);
+    if (monitor_capture_) monitor_capture_->set_paused(false);
     state_.store(State::Processing);
     if (finalize_worker_.joinable()) finalize_worker_.join();
     finalize_worker_ = std::thread(&RecordScreen::finalize, this);
@@ -368,8 +417,7 @@ void RecordScreen::finalize() {
     // virtual sink for all of it.
     echo_cancel_.reset();
 
-    long long duration =
-        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time_).count();
+    long long duration = recorded_seconds_;  // paused stretches excluded
 
     size_t n = std::max(mic_audio.size(), monitor_audio.size());
     std::vector<float> mixed(n, 0.0f);
@@ -407,7 +455,13 @@ void RecordScreen::finalize() {
                                                               ctx_.settings.email_prompt,
                                                               ctx_.settings.tasks_prompt});
         for (auto& t : result.tasks) {
-            ctx_.repo->add_task(t, call_id_, customer_id_, "", "call");
+            // The model can attribute a task to a customer other than the
+            // call's own (a task raised about a different account); that name
+            // becomes a real customer row so the task still files correctly.
+            std::optional<int64_t> task_customer = customer_id_;
+            if (!t.customer.empty() && t.customer != customer_name_)
+                task_customer = ctx_.repo->get_or_create_customer(t.customer);
+            ctx_.repo->add_task(t.description, call_id_, task_customer, t.due_date, "call", t.priority);
         }
         linked_tasks_dirty_ = true;
         ctx_.repo->add_note(call_id_, result.summary_text, result.email_draft, "[]");

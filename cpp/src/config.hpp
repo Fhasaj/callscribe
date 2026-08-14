@@ -18,7 +18,7 @@ inline const char* kDefaultEmailPrompt =
     "Write a professional follow-up email for the customer with clear points and the agreed tasks, "
     "ready to send, signed off generically (e.g. \"Best regards\").";
 inline const char* kDefaultTasksPrompt =
-    "List the concrete action items mentioned or implied in the call.";
+    "List the concrete action items mentioned or implied in the call, one entry per action.";
 
 std::filesystem::path config_dir();
 std::filesystem::path config_file();

@@ -84,6 +84,7 @@ add_library(callscribe_core STATIC
   src/transcription/whisper_engine.cpp
   src/calendar/ics_parser.cpp
   src/calendar/calendar_source.cpp
+  src/calendar/call_match.cpp
   src/llm/ollama_client.cpp
   src/llm/prompts.cpp
   src/llm/summarizer.cpp
@@ -135,6 +136,8 @@ if(CALLSCRIBE_BUILD_TESTS)
     tests/test_prompts.cpp
     tests/test_date_format.cpp
     tests/test_ics_parser.cpp
+    tests/test_call_match.cpp
+    tests/test_task_extract.cpp
     tests/test_text_wrap.cpp
     src/ui/text_wrap.cpp
   )

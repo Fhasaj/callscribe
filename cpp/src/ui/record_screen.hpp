@@ -25,10 +25,15 @@ public:
     RecordScreen& operator=(const RecordScreen&) = delete;
 
     ftxui::Component component() { return root_; }
-    bool is_recording() const { return state_.load() == State::Recording; }
+    // Paused counts as recording: the call is still open, and quitting would
+    // still lose it.
+    bool is_recording() const {
+        State s = state_.load();
+        return s == State::Recording || s == State::Paused;
+    }
 
 private:
-    enum class State { Idle, Recording, Processing };
+    enum class State { Idle, Recording, Paused, Processing };
 
     AppContext& ctx_;
 
@@ -39,7 +44,10 @@ private:
     std::string manual_notes_;  // your own free-form notes for this call, saved as you type
 
     std::atomic<State> state_{State::Idle};
+    // Elapsed time is the sum of the finished recording stretches plus the one
+    // currently running, so a pause doesn't inflate the call's duration.
     std::chrono::steady_clock::time_point start_time_;
+    long long recorded_seconds_ = 0;
 
     std::mutex text_mutex_;
     std::string live_transcript_;
@@ -64,6 +72,9 @@ private:
     std::string new_task_text_;
     std::vector<db::Task> linked_tasks_;
     std::atomic<bool> linked_tasks_dirty_{true};
+    // Also reloaded when any other screen writes (editing or completing one of
+    // these tasks over on the Tasks tab, for instance).
+    uint64_t seen_revision_ = 0;
 
     // Held for the length of a recording; its destructor restores the default
     // sink and unloads the echo-cancel module.
@@ -78,6 +89,8 @@ private:
 
     void start_recording();
     void stop_recording();
+    void toggle_pause();
+    long long elapsed_seconds() const;
     void mic_worker_loop();
     void monitor_worker_loop();
     void finalize();

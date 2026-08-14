@@ -29,6 +29,12 @@ public:
     // captured (for archival WAV writing). Closes the chunk queue.
     std::vector<float> stop();
 
+    // While paused, parec keeps running and its output keeps being drained
+    // (so the pipe never backs up and resuming is instant), but the samples
+    // are dropped: paused audio reaches neither the transcript nor the WAV.
+    void set_paused(bool paused) { paused_.store(paused); }
+    bool paused() const { return paused_.load(); }
+
     util::BlockingQueue<std::vector<float>>& chunks() { return chunk_queue_; }
 
     // Live input level (RMS of the most recent ~100ms block, roughly 0..1),
@@ -46,6 +52,7 @@ private:
     util::BlockingQueue<std::vector<float>> chunk_queue_;
 
     std::atomic<float> current_level_{0.0f};
+    std::atomic<bool> paused_{false};
 
     void reader_loop();
 };

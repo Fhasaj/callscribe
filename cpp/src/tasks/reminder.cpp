@@ -93,6 +93,10 @@ std::vector<db::Task> ReminderScheduler::fire_now() {
         for (size_t i = 0; i < limit; ++i) {
             if (!lines.empty()) lines += "\n";
             lines += "- " + due[i].description;
+            // Flag the urgent ones so the notification can be triaged without
+            // opening the app.
+            if (due[i].priority == db::kPriorityHigh) lines += " [HIGH]";
+            if (!due[i].customer_name.empty()) lines += " (" + due[i].customer_name + ")";
         }
         if (due.size() > 10) lines += "\n(+" + std::to_string(due.size() - 10) + " more)";
         send_notification(std::to_string(due.size()) + " task(s) due", lines);

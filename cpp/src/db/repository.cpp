@@ -1,5 +1,7 @@
 #include "db/repository.hpp"
 
+#include <cctype>
+
 #include "util/time.hpp"
 
 namespace callscribe::db {
@@ -18,6 +20,7 @@ int64_t Repository::get_or_create_customer(const std::string& name) {
     Stmt ins(db_, "INSERT INTO customers (name, created_at) VALUES (?, ?)");
     ins.bind(1, name).bind(2, util::now_iso());
     ins.execute();
+    bump();
     return ins.last_insert_rowid();
 }
 
@@ -44,6 +47,7 @@ int64_t Repository::create_call(std::optional<int64_t> customer_id, const std::s
     s.bind_opt_text(3, participants);
     s.bind(4, started_at.empty() ? util::now_iso() : started_at);
     s.execute();
+    bump();
     return s.last_insert_rowid();
 }
 
@@ -69,6 +73,7 @@ void Repository::finish_call(int64_t call_id, int duration_seconds, const std::s
     Stmt s(db_, "UPDATE calls SET ended_at = ?, duration_seconds = ?, audio_path = ?, status = ? WHERE id = ?");
     s.bind(1, util::now_iso()).bind(2, duration_seconds).bind_opt_text(3, audio_path).bind(4, status).bind(5, call_id);
     s.execute();
+    bump();
 }
 
 void Repository::set_call_status(int64_t call_id, const std::string& status) {
@@ -76,6 +81,7 @@ void Repository::set_call_status(int64_t call_id, const std::string& status) {
     Stmt s(db_, "UPDATE calls SET status = ? WHERE id = ?");
     s.bind(1, status).bind(2, call_id);
     s.execute();
+    bump();
 }
 
 void Repository::update_manual_notes(int64_t call_id, const std::string& notes) {
@@ -175,6 +181,7 @@ int64_t Repository::add_note(int64_t call_id, const std::string& summary, const 
            "VALUES (?, ?, ?, ?, ?)");
     s.bind(1, call_id).bind(2, summary).bind(3, email_draft).bind(4, key_points_json).bind(5, util::now_iso());
     s.execute();
+    bump();
     return s.last_insert_rowid();
 }
 
@@ -197,21 +204,48 @@ std::optional<Note> Repository::get_note_for_call(int64_t call_id) {
 
 // -- tasks ----------------------------------------------------------------
 
+std::string normalize_priority(const std::string& text) {
+    std::string lower;
+    for (char c : text) lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower.find("high") != std::string::npos || lower.find("urgent") != std::string::npos ||
+        lower.find("critical") != std::string::npos || lower == "p1" || lower == "1")
+        return kPriorityHigh;
+    if (lower.find("low") != std::string::npos || lower.find("minor") != std::string::npos || lower == "p3" ||
+        lower == "3")
+        return kPriorityLow;
+    return kPriorityMedium;
+}
+
 int64_t Repository::add_task(const std::string& description, std::optional<int64_t> call_id,
                               std::optional<int64_t> customer_id, const std::string& due_date,
-                              const std::string& source) {
+                              const std::string& source, const std::string& priority) {
     std::lock_guard<std::mutex> lock(mutex_);
     Stmt s(db_,
-           "INSERT INTO tasks (call_id, customer_id, description, due_date, status, source, created_at) "
-           "VALUES (?, ?, ?, ?, 'open', ?, ?)");
+           "INSERT INTO tasks (call_id, customer_id, description, due_date, priority, status, source, created_at) "
+           "VALUES (?, ?, ?, ?, ?, 'open', ?, ?)");
     s.bind_opt(1, call_id)
         .bind_opt(2, customer_id)
         .bind(3, description)
         .bind_opt_text(4, due_date)
-        .bind(5, source)
-        .bind(6, util::now_iso());
+        .bind(5, normalize_priority(priority))
+        .bind(6, source)
+        .bind(7, util::now_iso());
     s.execute();
+    bump();
     return s.last_insert_rowid();
+}
+
+void Repository::update_task(int64_t task_id, const std::string& description, const std::string& due_date,
+                              const std::string& priority, std::optional<int64_t> customer_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_, "UPDATE tasks SET description = ?, due_date = ?, priority = ?, customer_id = ? WHERE id = ?");
+    s.bind(1, description)
+        .bind_opt_text(2, due_date)
+        .bind(3, normalize_priority(priority))
+        .bind_opt(4, customer_id)
+        .bind(5, task_id);
+    s.execute();
+    bump();
 }
 
 namespace {
@@ -223,15 +257,20 @@ Task read_task_row(Stmt& s) {
     t.customer_name = s.text(3);
     t.description = s.text(4);
     t.due_date = s.text(5);
-    t.status = s.text(6);
-    t.source = s.text(7);
-    t.created_at = s.text(8);
-    t.completed_at = s.text(9);
+    t.priority = s.text(6).empty() ? kPriorityMedium : s.text(6);
+    t.status = s.text(7);
+    t.source = s.text(8);
+    t.created_at = s.text(9);
+    t.completed_at = s.text(10);
     return t;
 }
 constexpr const char* kTaskColumns =
     "tasks.id, tasks.call_id, tasks.customer_id, customers.name, tasks.description, "
-    "tasks.due_date, tasks.status, tasks.source, tasks.created_at, tasks.completed_at ";
+    "tasks.due_date, tasks.priority, tasks.status, tasks.source, tasks.created_at, tasks.completed_at ";
+// Highest priority first within the same due date, so what to do next reads
+// straight off the top of the list.
+constexpr const char* kPriorityRank =
+    "CASE tasks.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END";
 }  // namespace
 
 std::vector<Task> Repository::list_tasks(const std::string& status, const std::string& customer_name) {
@@ -239,7 +278,8 @@ std::vector<Task> Repository::list_tasks(const std::string& status, const std::s
                        "FROM tasks LEFT JOIN customers ON customers.id = tasks.customer_id WHERE 1=1";
     if (!status.empty()) sql += " AND tasks.status = ?";
     if (!customer_name.empty()) sql += " AND customers.name = ?";
-    sql += " ORDER BY (tasks.due_date IS NULL), tasks.due_date, tasks.created_at DESC";
+    sql += std::string(" ORDER BY (tasks.due_date IS NULL), tasks.due_date, ") + kPriorityRank +
+            ", tasks.created_at DESC";
 
     std::lock_guard<std::mutex> lock(mutex_);
     Stmt s(db_, sql);
@@ -267,6 +307,7 @@ void Repository::complete_task(int64_t task_id) {
     Stmt s(db_, "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?");
     s.bind(1, util::now_iso()).bind(2, task_id);
     s.execute();
+    bump();
 }
 
 void Repository::reopen_task(int64_t task_id) {
@@ -274,6 +315,7 @@ void Repository::reopen_task(int64_t task_id) {
     Stmt s(db_, "UPDATE tasks SET status = 'open', completed_at = NULL WHERE id = ?");
     s.bind(1, task_id);
     s.execute();
+    bump();
 }
 
 void Repository::delete_task(int64_t task_id) {
@@ -281,6 +323,7 @@ void Repository::delete_task(int64_t task_id) {
     Stmt s(db_, "DELETE FROM tasks WHERE id = ?");
     s.bind(1, task_id);
     s.execute();
+    bump();
 }
 
 std::vector<Task> Repository::due_tasks(const std::string& on_or_before) {
@@ -288,7 +331,8 @@ std::vector<Task> Repository::due_tasks(const std::string& on_or_before) {
     Stmt s(db_, std::string("SELECT ") + kTaskColumns +
                     "FROM tasks LEFT JOIN customers ON customers.id = tasks.customer_id "
                     "WHERE tasks.status = 'open' AND (tasks.due_date IS NULL OR tasks.due_date <= ?) "
-                    "ORDER BY tasks.due_date IS NULL, tasks.due_date");
+                    "ORDER BY tasks.due_date IS NULL, tasks.due_date, " +
+                    kPriorityRank);
     s.bind(1, on_or_before);
     std::vector<Task> out;
     while (s.step()) out.push_back(read_task_row(s));

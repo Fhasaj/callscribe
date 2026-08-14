@@ -96,6 +96,56 @@ TEST_CASE("tasks: extraction from a call and completion") {
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("tasks: priority defaults to medium, and editing rewrites every field") {
+    auto dir = make_temp_db_dir();
+    Database db((dir / "test.db").string());
+    Repository repo(db);
+
+    int64_t task_id = repo.add_task("Chase the alarm request");
+    auto tasks = repo.list_tasks("open");
+    REQUIRE(tasks.size() == 1);
+    CHECK(tasks[0].priority == kPriorityMedium);
+    CHECK(tasks[0].due_date.empty());
+    CHECK(tasks[0].customer_name.empty());
+
+    int64_t cust_id = repo.get_or_create_customer("Kingston");
+    repo.update_task(task_id, "Chase the alarm request with Emma", "2026-09-01", "High", cust_id);
+
+    tasks = repo.list_tasks("open");
+    REQUIRE(tasks.size() == 1);
+    CHECK(tasks[0].description == "Chase the alarm request with Emma");
+    CHECK(tasks[0].due_date == "2026-09-01");
+    CHECK(tasks[0].priority == kPriorityHigh);
+    CHECK(tasks[0].customer_name == "Kingston");
+
+    // Clearing the due date is an edit like any other.
+    repo.update_task(task_id, "Chase the alarm request", "", "low", std::nullopt);
+    tasks = repo.list_tasks("open");
+    CHECK(tasks[0].due_date.empty());
+    CHECK(tasks[0].priority == kPriorityLow);
+    CHECK(tasks[0].customer_name.empty());
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("tasks: same due date sorts high priority first") {
+    auto dir = make_temp_db_dir();
+    Database db((dir / "test.db").string());
+    Repository repo(db);
+
+    repo.add_task("Low one", std::nullopt, std::nullopt, "2026-09-01", "manual", "low");
+    repo.add_task("High one", std::nullopt, std::nullopt, "2026-09-01", "manual", "high");
+    repo.add_task("Medium one", std::nullopt, std::nullopt, "2026-09-01", "manual", "medium");
+
+    auto tasks = repo.list_tasks("open");
+    REQUIRE(tasks.size() == 3);
+    CHECK(tasks[0].description == "High one");
+    CHECK(tasks[1].description == "Medium one");
+    CHECK(tasks[2].description == "Low one");
+
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("due_tasks includes overdue and no-due-date, excludes future") {
     auto dir = make_temp_db_dir();
     Database db((dir / "test.db").string());

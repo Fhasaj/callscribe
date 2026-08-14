@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     customer_id INTEGER REFERENCES customers(id),
     description TEXT NOT NULL,
     due_date TEXT,
+    priority TEXT NOT NULL DEFAULT 'medium',
     status TEXT NOT NULL DEFAULT 'open',
     source TEXT NOT NULL DEFAULT 'manual',
     created_at TEXT NOT NULL,
@@ -89,6 +90,8 @@ Database::Database(const std::string& path) {
     // CREATE TABLE IF NOT EXISTS above is a no-op on an existing table, so
     // add the column here; ignore the error if it's already present.
     sqlite3_exec(db_, "ALTER TABLE calls ADD COLUMN manual_notes TEXT", nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'", nullptr, nullptr,
+                 nullptr);
 }
 
 Database::~Database() {

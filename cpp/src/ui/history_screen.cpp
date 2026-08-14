@@ -7,6 +7,7 @@
 #include "llm/summarizer.hpp"
 #include "ui/scroll_pane.hpp"
 #include "ui/styled_input.hpp"
+#include "ui/task_meta.hpp"
 #include "ui/theme.hpp"
 #include "ui/wrapped_input.hpp"
 #include "util/clipboard.hpp"
@@ -24,6 +25,13 @@ HistoryScreen::~HistoryScreen() {
 }
 
 void HistoryScreen::refresh_list() {
+    // Reloading must not move the user off the call they were reading, so the
+    // selection is restored by id rather than by position (a new call lands at
+    // the top of the list and shifts every index below it).
+    int64_t previously_selected =
+        (selected_ >= 0 && selected_ < static_cast<int>(calls_.size())) ? calls_[selected_].id : -1;
+
+    seen_revision_ = ctx_.repo->revision();
     calls_ = ctx_.repo->list_calls("", search_text_);
     call_labels_.clear();
     for (auto& c : calls_) {
@@ -35,6 +43,13 @@ void HistoryScreen::refresh_list() {
         }
         call_labels_.push_back(when + " -- " + (c.customer_name.empty() ? "Unknown" : c.customer_name) + " (" +
                                 c.status + ")");
+    }
+    if (previously_selected >= 0) {
+        for (size_t i = 0; i < calls_.size(); ++i) {
+            if (calls_[i].id != previously_selected) continue;
+            selected_ = static_cast<int>(i);
+            break;
+        }
     }
     if (selected_ >= static_cast<int>(call_labels_.size())) {
         selected_ = std::max(0, static_cast<int>(call_labels_.size()) - 1);
@@ -109,7 +124,12 @@ void HistoryScreen::regenerate() {
                                                llm::PromptPresets{ctx_.settings.summary_prompt,
                                                                   ctx_.settings.email_prompt,
                                                                   ctx_.settings.tasks_prompt});
-            for (auto& t : result.tasks) ctx_.repo->add_task(t, call.id, call.customer_id, "", "call");
+            for (auto& t : result.tasks) {
+                std::optional<int64_t> task_customer = call.customer_id;
+                if (!t.customer.empty() && t.customer != call.customer_name)
+                    task_customer = ctx_.repo->get_or_create_customer(t.customer);
+                ctx_.repo->add_task(t.description, call.id, task_customer, t.due_date, "call", t.priority);
+            }
             linked_tasks_dirty_ = true;
             ctx_.repo->add_note(call.id, result.summary_text, result.email_draft, "[]");
             std::lock_guard<std::mutex> lock(detail_mutex_);
@@ -233,6 +253,7 @@ void HistoryScreen::build_ui() {
                          Element e = text(line);
                          if (done) e |= color(theme::kMuted);
                          task_lines.push_back(e);
+                         task_lines.push_back(text("    " + task_meta_line(t)) | color(theme::kMuted));
                      }
                      if (task_lines.empty()) task_lines.push_back(text("(no tasks linked to this call yet)") | dim);
 
@@ -267,6 +288,10 @@ void HistoryScreen::build_ui() {
     auto layout = Container::Horizontal({left, right});
 
     root_ = Renderer(layout, [this, search_input, search_button, call_menu, inner_menu, inner_tab_container] {
+        // Picks up calls (and summaries) written by another screen -- notably
+        // the call the Record tab just finished processing.
+        if (ctx_.repo->revision() != seen_revision_) refresh_list();
+
         Element left_pane = vbox({
                                 hbox({search_input->Render() | flex, search_button->Render()}),
                                 separator() | color(theme::kMuted),

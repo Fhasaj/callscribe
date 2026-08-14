@@ -1,4 +1,4 @@
-# CallScribe (C++ / FTXUI terminal version)
+# CallScribe (C++ / FTXUI terminal version) - Personal Branch 
 
 A terminal-UI rebuild of CallScribe -- local-first Teams call notes: mic +
 speaker-loopback capture, local Whisper (whisper.cpp) transcription with
@@ -76,9 +76,13 @@ Go to the **Settings** screen and:
   re-generate a summary.
 - **Tasks** -- manual + call-extracted tasks, checkable, with a daily
   desktop notification for what's open.
-- **Calendar** -- a read-only agenda imported from your Teams/Outlook
-  calendar (Today / Next 7 days / This month). No Microsoft sign-in:
-  see [Importing your calendar](#importing-your-calendar) below.
+- **Calendar** -- your Teams/Outlook calendar, read-only, drawn as a
+  real calendar: **Day** (hour-by-hour with a marker on the current
+  hour), **Week** (seven columns from today), or **Month** (a
+  Monday-first grid with today's cell outlined). An **Agenda** toggle
+  switches any of them to a flat chronological list with organizer,
+  location and join links. No Microsoft sign-in: see
+  [Importing your calendar](#importing-your-calendar) below.
 - **Yearly Summary** -- stats for a chosen year plus an optional
   LLM-written prose recap.
 - **Proofread** -- a small chat: paste or type an email, press Send,
@@ -124,6 +128,10 @@ Either way, the last successfully read feed is cached at
 `~/.local/share/callscribe-cpp/calendar-cache.ics`, so the agenda still
 renders when you're offline or the link is temporarily failing; the
 status line says when it's showing a stale copy and why.
+
+In the grids, a meeting in progress shows green, past ones grey, and
+anything marked "show as free" is dimmed. Month cells show up to three
+meetings plus a `+n more` count; switch to Week or Agenda for the rest.
 
 Recurring meetings are expanded locally (daily/weekly/monthly/yearly
 rules with `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTHDAY`,

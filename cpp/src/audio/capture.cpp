@@ -84,6 +84,21 @@ void StreamCapture::reader_loop() {
         }
         if (total_read == 0) break;
 
+        // Paused: the block was still read (parec's pipe must keep draining or
+        // it blocks and resuming would replay stale audio), but it is dropped.
+        // The pending chunk is flushed on the way in so the utterance that was
+        // in progress still gets transcribed rather than being stitched onto
+        // whatever is said after the resume.
+        if (paused_.load()) {
+            current_level_.store(0.0f);
+            if (!pending_.empty()) {
+                chunk_queue_.push(std::move(pending_));
+                pending_.clear();
+            }
+            if (total_read < block_bytes) break;
+            continue;
+        }
+
         size_t n_samples = total_read / sizeof(int16_t);
         const int16_t* pcm = reinterpret_cast<const int16_t*>(buf.data());
         std::vector<float> samples(n_samples);

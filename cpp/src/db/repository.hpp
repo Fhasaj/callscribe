@@ -2,6 +2,7 @@
 #include "db/database.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -49,6 +50,16 @@ struct Note {
     std::string created_at;
 };
 
+// Priority is stored lower-case ("low" / "medium" / "high"); use
+// normalize_priority() on anything that came from a user or a model.
+inline constexpr const char* kPriorityLow = "low";
+inline constexpr const char* kPriorityMedium = "medium";
+inline constexpr const char* kPriorityHigh = "high";
+
+// Maps free text ("High", "urgent", "P1", "") onto one of the three stored
+// values; anything unrecognized becomes "medium".
+std::string normalize_priority(const std::string& text);
+
 struct Task {
     int64_t id = 0;
     std::optional<int64_t> call_id;
@@ -56,6 +67,7 @@ struct Task {
     std::string customer_name;
     std::string description;
     std::string due_date;
+    std::string priority = kPriorityMedium;
     std::string status;
     std::string source;
     std::string created_at;
@@ -99,7 +111,11 @@ public:
 
     int64_t add_task(const std::string& description, std::optional<int64_t> call_id = std::nullopt,
                       std::optional<int64_t> customer_id = std::nullopt, const std::string& due_date = "",
-                      const std::string& source = "manual");
+                      const std::string& source = "manual", const std::string& priority = kPriorityMedium);
+    // Edits the user-facing fields of an existing task; status/source/call
+    // linkage are left alone. An empty due_date clears the due date.
+    void update_task(int64_t task_id, const std::string& description, const std::string& due_date,
+                      const std::string& priority, std::optional<int64_t> customer_id);
     std::vector<Task> list_tasks(const std::string& status = "", const std::string& customer_name = "");
     std::vector<Task> list_tasks_for_call(int64_t call_id);
     void complete_task(int64_t task_id);
@@ -109,9 +125,24 @@ public:
 
     YearlyStats yearly_stats(int year);
 
+    // Bumped by every write that changes what another screen might be
+    // showing -- a finished call, a new/edited/completed task, a summary. The
+    // screens are independent components that each cache their own query
+    // results, so they compare this against what they last saw and reload
+    // when it moves; that is how the Tasks and History tabs pick up a call
+    // the Record tab just summarized.
+    //
+    // Deliberately NOT bumped by append_segment() or update_manual_notes():
+    // those fire per transcribed chunk and per keystroke, and would have the
+    // other screens rebuilding themselves continuously mid-call.
+    uint64_t revision() const { return revision_.load(); }
+
 private:
     sqlite3* db_;
     std::mutex mutex_;
+    std::atomic<uint64_t> revision_{0};
+
+    void bump() { revision_.fetch_add(1); }
 };
 
 }  // namespace callscribe::db

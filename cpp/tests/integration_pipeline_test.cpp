@@ -88,12 +88,15 @@ int main() {
     auto result = llm::summarize_call("http://localhost:11434", "qwen2.5:7b-instruct", stored_transcript,
                                        "Pipeline Test Customer", "Pipeline Test Meeting", "Sarah", "2026-07-28");
     repo.add_note(call_id, result.summary_text, result.email_draft, "[]");
-    for (auto& t : result.tasks) repo.add_task(t, call_id, customer_id, "", "call");
+    for (auto& t : result.tasks)
+        repo.add_task(t.description, call_id, customer_id, t.due_date, "call", t.priority);
 
     std::cout << "\nSUMMARY:\n" << result.summary_text << "\n";
     std::cout << "\nEMAIL:\n" << result.email_draft << "\n";
     std::cout << "\nTASKS: " << result.tasks.size() << "\n";
-    for (auto& t : result.tasks) std::cout << "  - " << t << "\n";
+    for (auto& t : result.tasks)
+        std::cout << "  - " << t.description << " | due " << (t.due_date.empty() ? "-" : t.due_date) << " | "
+                  << t.priority << " | " << (t.customer.empty() ? "-" : t.customer) << "\n";
 
     check(!result.summary_text.empty(), "expected a non-empty summary from Ollama");
     check(!result.email_draft.empty(), "expected a non-empty email draft from Ollama");

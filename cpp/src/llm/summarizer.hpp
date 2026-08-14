@@ -9,11 +9,31 @@
 
 namespace callscribe::llm {
 
+// One action item pulled out of a call. `due_date` is ISO (or empty for "no
+// date"), `priority` is one of db::kPriority*, and `customer` is the company
+// the task belongs to (usually, but not always, the call's own customer).
+struct ExtractedTask {
+    std::string description;
+    std::string due_date;
+    std::string priority = db::kPriorityMedium;
+    std::string customer;
+};
+
 struct CallSummaryResult {
     std::string summary_text;
     std::string email_draft;
-    std::vector<std::string> tasks;
+    std::vector<ExtractedTask> tasks;
 };
+
+// Turns whatever the model put in the "tasks" key into one ExtractedTask per
+// action. Models routinely ignore the object schema and answer with plain
+// strings, a numbered list crammed into one string, or a markdown table -- all
+// of which used to land in the DB as a single unusable "task" -- so each of
+// those shapes is unpicked here instead. `default_customer` fills in tasks
+// with no customer of their own, and `reference_date` (ISO) is what relative
+// due dates like "tomorrow" are resolved against.
+std::vector<ExtractedTask> parse_task_items(const nlohmann::json& node, const std::string& default_customer,
+                                             const std::string& reference_date);
 
 // Summarizes a call. Transcripts too long for the model's context window are
 // condensed in slices first and the slice bullets summarized together, so an
