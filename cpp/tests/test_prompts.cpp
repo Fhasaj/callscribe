@@ -38,3 +38,23 @@ TEST_CASE("proofread prompt includes the original email and asks for text-only o
     CHECK(prompt.find("hey can u send me teh contract") != std::string::npos);
     CHECK(prompt.find("ONLY the corrected email text") != std::string::npos);
 }
+
+TEST_CASE("KPI report prompt lists the user's KPIs and asks for report + email JSON") {
+    std::vector<std::pair<std::string, int>> top = {{"Acme", 4}};
+    std::string prompt = build_kpi_report_prompt(2026, "annual", {"Renewals secured", "Escalations resolved"},
+                                                  {"Discussed renewal."}, 12, 7200, 5, top);
+    CHECK(prompt.find("annual") != std::string::npos);
+    CHECK(prompt.find("1. Renewals secured") != std::string::npos);
+    CHECK(prompt.find("2. Escalations resolved") != std::string::npos);
+    CHECK(prompt.find("Total calls: 12") != std::string::npos);
+    CHECK(prompt.find("Discussed renewal.") != std::string::npos);
+    CHECK(prompt.find("\"report\"") != std::string::npos);
+    CHECK(prompt.find("\"email_subject\"") != std::string::npos);
+    CHECK(prompt.find("\"email_body\"") != std::string::npos);
+}
+
+TEST_CASE("KPI report prompt still works with no KPIs") {
+    std::string prompt = build_kpi_report_prompt(2026, "semi-annual", {}, {"Discussed renewal."}, 3, 3600, 1, {});
+    CHECK(prompt.find("No specific KPIs were requested") != std::string::npos);
+    CHECK(prompt.find("\"report\"") != std::string::npos);
+}

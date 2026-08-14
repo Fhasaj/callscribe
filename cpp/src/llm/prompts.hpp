@@ -22,14 +22,16 @@ std::string build_yearly_narrative_prompt(int year, const std::vector<std::strin
                                            long long total_seconds, int tasks_completed,
                                            const std::vector<std::pair<std::string, int>>& top_customers);
 
-// Performance-review report. `cycle_label` is e.g. "semi-annual" or "annual"
-// and `questions` are the review prompts the user picked in the wizard; the
-// model answers each one from the call history in `summaries`.
-std::string build_review_report_prompt(int year, const std::string& cycle_label,
-                                        const std::vector<std::string>& questions,
-                                        const std::vector<std::string>& summaries, int call_count,
-                                        long long total_seconds, int tasks_completed,
-                                        const std::vector<std::pair<std::string, int>>& top_customers);
+// KPI report. `cycle_label` is e.g. "semi-annual" or "annual" and `kpis` are
+// the KPIs the user asked to have tracked; the model reports on each one from
+// the year's activity and the call history in `summaries`. Asks for JSON with
+// "report", "email_subject" and "email_body" so the same run yields both the
+// long-form report and a ready-to-send email.
+std::string build_kpi_report_prompt(int year, const std::string& cycle_label,
+                                     const std::vector<std::string>& kpis,
+                                     const std::vector<std::string>& summaries, int call_count,
+                                     long long total_seconds, int tasks_completed,
+                                     const std::vector<std::pair<std::string, int>>& top_customers);
 
 std::string build_proofread_prompt(const std::string& email_text);
 

@@ -335,12 +335,49 @@ std::string generate_yearly_narrative(const std::string& host, const std::string
     return generate_text(host, model, prompt);
 }
 
-std::string generate_review_report(const std::string& host, const std::string& model, int year,
-                                    const std::string& cycle_label, const std::vector<std::string>& questions,
-                                    const db::YearlyStats& stats) {
-    std::string prompt = build_review_report_prompt(year, cycle_label, questions, stats.summaries, stats.call_count,
-                                                     stats.total_seconds, stats.tasks_completed, stats.top_customers);
-    return generate_text(host, model, prompt);
+KpiReport generate_kpi_report(const std::string& host, const std::string& model, int year,
+                               const std::string& cycle_label, const std::vector<std::string>& kpis,
+                               const db::YearlyStats& stats) {
+    std::string prompt = build_kpi_report_prompt(year, cycle_label, kpis, stats.summaries, stats.call_count,
+                                                  stats.total_seconds, stats.tasks_completed, stats.top_customers);
+    nlohmann::json data = generate_json(host, model, prompt);
+
+    auto as_string = [&data](const char* key) -> std::string {
+        if (!data.contains(key)) return "";
+        const auto& v = data.at(key);
+        if (v.is_string()) return trim(v.get<std::string>());
+        // Some models answer with an array of paragraphs/bullets instead of one
+        // string; join rather than throwing the whole report away.
+        if (v.is_array()) {
+            std::string joined;
+            for (const auto& part : v) {
+                if (!part.is_string()) continue;
+                if (!joined.empty()) joined += "\n";
+                joined += part.get<std::string>();
+            }
+            return trim(joined);
+        }
+        return "";
+    };
+
+    KpiReport out;
+    out.report_text = as_string("report");
+    out.email_subject = as_string("email_subject");
+    out.email_body = as_string("email_body");
+
+    if (out.report_text.empty() && out.email_body.empty()) {
+        throw OllamaError(
+            "The model returned an empty report. It may not be following the JSON format -- try a "
+            "different model in Settings.");
+    }
+    // A report with no email half (or the other way round) is still usable, so
+    // fall back to the half that did come back rather than failing the run.
+    if (out.report_text.empty()) out.report_text = out.email_body;
+    if (out.email_body.empty()) out.email_body = out.report_text;
+    if (out.email_subject.empty()) {
+        out.email_subject = std::to_string(year) + " " + cycle_label + " performance report";
+    }
+    return out;
 }
 
 ChatReply proofread_email(const std::string& host, const std::string& model, const std::string& email_text,

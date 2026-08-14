@@ -1,4 +1,4 @@
-# CallScribe (C++ / FTXUI terminal version) - Personal Branch 
+# CallScribe (C++ / FTXUI terminal version)
 
 A terminal-UI rebuild of CallScribe -- local-first Teams call notes: mic +
 speaker-loopback capture, local Whisper (whisper.cpp) transcription with

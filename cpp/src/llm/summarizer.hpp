@@ -57,11 +57,19 @@ CallSummaryResult summarize_call(const std::string& host, const std::string& mod
 std::string generate_yearly_narrative(const std::string& host, const std::string& model, int year,
                                        const db::YearlyStats& stats);
 
-// Answers the review questions picked in the Yearly Summary wizard against the
-// year's call history. `cycle_label` is "semi-annual" or "annual".
-std::string generate_review_report(const std::string& host, const std::string& model, int year,
-                                    const std::string& cycle_label, const std::vector<std::string>& questions,
-                                    const db::YearlyStats& stats);
+// A generated report in both of the forms the Yearly Summary screen offers:
+// the long-form report (exported as PDF) and an email-ready version of it.
+struct KpiReport {
+    std::string report_text;
+    std::string email_subject;
+    std::string email_body;
+};
+
+// Reports on the KPIs picked in the Yearly Summary wizard against the year's
+// call history. `cycle_label` is "semi-annual" or "annual".
+KpiReport generate_kpi_report(const std::string& host, const std::string& model, int year,
+                               const std::string& cycle_label, const std::vector<std::string>& kpis,
+                               const db::YearlyStats& stats);
 
 // The two Chat-screen entry points. Both return the model's reasoning
 // alongside the answer (empty for models that don't reason) and report

@@ -102,14 +102,14 @@ std::string build_yearly_narrative_prompt(int year, const std::vector<std::strin
     return out.str();
 }
 
-std::string build_review_report_prompt(int year, const std::string& cycle_label,
-                                        const std::vector<std::string>& questions,
-                                        const std::vector<std::string>& summaries, int call_count,
-                                        long long total_seconds, int tasks_completed,
-                                        const std::vector<std::pair<std::string, int>>& top_customers) {
+std::string build_kpi_report_prompt(int year, const std::string& cycle_label,
+                                     const std::vector<std::string>& kpis,
+                                     const std::vector<std::string>& summaries, int call_count,
+                                     long long total_seconds, int tasks_completed,
+                                     const std::vector<std::pair<std::string, int>>& top_customers) {
     std::ostringstream out;
-    out << "You are helping a salesperson/account manager draft their " << cycle_label
-        << " performance review self-assessment, using their own call notes from " << year
+    out << "You are helping a salesperson/account manager put together their " << cycle_label
+        << " performance report, using their own call notes from " << year
         << " as the evidence base.\n\n";
     out << "Activity for " << year << ":\n";
     out << "- Total calls: " << call_count << "\n";
@@ -132,16 +132,34 @@ std::string build_review_report_prompt(int year, const std::string& cycle_label,
         for (size_t i = 0; i < limit; ++i) out << "- " << summaries[i] << "\n";
     }
 
-    out << "\nAnswer each of the following review questions, in order:\n";
-    for (size_t i = 0; i < questions.size(); ++i) out << (i + 1) << ". " << questions[i] << "\n";
+    if (kpis.empty()) {
+        out << "\nNo specific KPIs were requested -- report on the overall activity above.\n";
+    } else {
+        out << "\nReport against each of the following KPIs, in this order:\n";
+        for (size_t i = 0; i < kpis.size(); ++i) out << (i + 1) << ". " << kpis[i] << "\n";
+    }
 
-    out << "\nWrite the answers in the first person, as the person being reviewed. For each "
-           "question, repeat the question as a plain-text heading line, then give 2-4 short "
-           "paragraphs or bullets answering it. Ground every claim in the activity and call notes "
-           "above -- cite concrete customers, deals, or action items where you can, and do not "
-           "invent specifics that aren't supported. If the notes don't support an answer to a "
-           "question, say plainly what evidence is missing rather than making something up. Plain "
-           "text, no markdown headers.\n";
+    out << "\nRespond with ONLY a JSON object (no markdown, no commentary) with exactly these "
+           "keys:\n";
+    out << "- \"report\": a single plain-text string -- the full report, written in the first "
+           "person. Start with a short overall summary paragraph";
+    if (!kpis.empty()) {
+        out << ", then one section per KPI in the order listed: the KPI name on its own heading "
+               "line, then the figure or evidence for it from the activity data above, then 1-3 "
+               "sentences of commentary";
+    }
+    out << ". Separate sections with a blank line.\n";
+    out << "- \"email_subject\": a single short plain-text subject line for emailing this report to "
+           "a manager.\n";
+    out << "- \"email_body\": a single plain-text string -- the same report condensed into a "
+           "ready-to-send email: a greeting, a short intro, the KPI figures as \"- \" bullet lines, "
+           "and a sign-off. Write each paragraph as one continuous line -- do not hard-wrap to a "
+           "fixed column width.\n\n";
+    out << "Ground every claim in the activity and call notes above -- cite concrete customers, "
+           "deals, or action items where you can, and do not invent specifics that aren't "
+           "supported. If the notes carry no evidence for a KPI, say plainly that it isn't tracked "
+           "in the call notes rather than making a figure up. Plain text throughout, no markdown "
+           "headers.\n";
     return out.str();
 }
 

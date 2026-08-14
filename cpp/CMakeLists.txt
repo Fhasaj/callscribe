@@ -76,6 +76,7 @@ add_library(callscribe_core STATIC
   src/util/virtual_pointer.cpp
   src/util/wav_writer.cpp
   src/util/date_format.cpp
+  src/util/pdf_writer.cpp
   src/db/database.cpp
   src/db/repository.cpp
   src/audio/devices.cpp
@@ -134,6 +135,7 @@ if(CALLSCRIBE_BUILD_TESTS)
   add_executable(callscribe_tests
     tests/test_repository.cpp
     tests/test_prompts.cpp
+    tests/test_pdf_writer.cpp
     tests/test_date_format.cpp
     tests/test_ics_parser.cpp
     tests/test_call_match.cpp

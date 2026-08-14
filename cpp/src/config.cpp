@@ -31,6 +31,16 @@ std::filesystem::path recordings_dir() { return data_dir() / "recordings"; }
 std::filesystem::path models_dir() { return data_dir() / "models"; }
 std::filesystem::path default_db_path() { return data_dir() / "callscribe.db"; }
 
+std::vector<std::string> default_report_kpis() {
+    return {
+        "Calls completed",
+        "Total time spent on calls",
+        "Customer follow-ups sent",
+        "Action items completed",
+        "Accounts engaged",
+    };
+}
+
 Settings Settings::with_defaults() {
     Settings s;
     s.db_path = default_db_path().string();
@@ -79,6 +89,18 @@ Settings load_settings() {
     load_prompt("summary_prompt", s.summary_prompt);
     load_prompt("email_prompt", s.email_prompt);
     load_prompt("tasks_prompt", s.tasks_prompt);
+    // An explicitly empty KPI list is a valid choice (the report then just
+    // covers the activity as a whole), so only a missing/malformed key falls
+    // back to the defaults.
+    if (j.contains("report_kpis") && j.at("report_kpis").is_array()) {
+        std::vector<std::string> kpis;
+        for (const auto& k : j.at("report_kpis")) {
+            if (!k.is_string()) continue;
+            std::string v = k.get<std::string>();
+            if (!v.empty()) kpis.push_back(std::move(v));
+        }
+        s.report_kpis = std::move(kpis);
+    }
     return s;
 }
 
@@ -105,6 +127,7 @@ void save_settings(const Settings& s) {
     j["summary_prompt"] = s.summary_prompt;
     j["email_prompt"] = s.email_prompt;
     j["tasks_prompt"] = s.tasks_prompt;
+    j["report_kpis"] = s.report_kpis;
     std::ofstream out(config_file());
     out << j.dump(2);
     out.close();

@@ -1,6 +1,7 @@
 #pragma once
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace callscribe {
 
@@ -19,6 +20,11 @@ inline const char* kDefaultEmailPrompt =
     "ready to send, signed off generically (e.g. \"Best regards\").";
 inline const char* kDefaultTasksPrompt =
     "List the concrete action items mentioned or implied in the call, one entry per action.";
+
+// Starting KPI list for the report generator. Only a starting point -- the
+// report wizard lets the user add and remove entries, and whatever they end up
+// with is what the report is built around.
+std::vector<std::string> default_report_kpis();
 
 std::filesystem::path config_dir();
 std::filesystem::path config_file();
@@ -58,6 +64,9 @@ struct Settings {
     std::string summary_prompt = kDefaultSummaryPrompt;
     std::string email_prompt = kDefaultEmailPrompt;
     std::string tasks_prompt = kDefaultTasksPrompt;
+
+    // KPIs the report generator reports against, in display order.
+    std::vector<std::string> report_kpis = default_report_kpis();
 
     static Settings with_defaults();
 };
