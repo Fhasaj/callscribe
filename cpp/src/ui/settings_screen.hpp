@@ -22,6 +22,9 @@ public:
     SettingsScreen& operator=(const SettingsScreen&) = delete;
 
     ftxui::Component component() { return root_; }
+    // True while a mic/speaker test is running its live level gauge, which
+    // needs the fast redraw tick to look smooth.
+    bool needs_fast_redraw() const { return testing_.load(); }
 
 private:
     AppContext& ctx_;
@@ -40,6 +43,7 @@ private:
     std::vector<std::string> monitor_names_;
     int monitor_selected_ = 0;
 
+    std::string ollama_keep_alive_;
     std::string user_display_name_;
     std::string db_path_;
     std::string reminder_time_;
@@ -72,6 +76,7 @@ private:
     void refresh_models();
     void refresh_audio_devices();
     void pull_recommended();
+    void unload_now();
     void download_model();
     void start_mic_test();
     void start_monitor_test();

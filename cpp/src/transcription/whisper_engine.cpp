@@ -75,7 +75,9 @@ struct GpuChoice {
 
 // Weights are only part of it -- the KV cache, compute buffers and allocator
 // fragmentation all need room on top, so require a healthy margin over the
-// file size rather than just fitting the weights.
+// file size rather than just fitting the weights. The weights are loaded once
+// and shared, but every concurrent state carries its own working buffers, so
+// that margin is charged per state.
 //
 // First fit wins deliberately: CUDA enumerates fastest-first by default, so the
 // first device that has room is the best card that has room, and we only drop
@@ -83,9 +85,10 @@ struct GpuChoice {
 // of nvidia-smi's, which numbers by PCI bus -- on a mixed pair, CUDA0 is not
 // necessarily nvidia-smi's GPU 0.) Picking the device with the most free memory
 // instead would sometimes land on the slower card.
-GpuChoice choose_gpu(size_t model_bytes) {
+GpuChoice choose_gpu(size_t model_bytes, int state_count) {
     GpuChoice choice;
-    const size_t needed = model_bytes + model_bytes / 3 + (size_t{256} << 20);
+    const size_t per_state = model_bytes / 3 + (size_t{256} << 20);
+    const size_t needed = model_bytes + per_state * static_cast<size_t>(std::max(1, state_count));
     int ordinal = 0;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -106,7 +109,7 @@ GpuChoice choose_gpu(size_t model_bytes) {
 
 }  // namespace
 
-WhisperEngine::WhisperEngine(const std::string& model_path) {
+WhisperModel::WhisperModel(const std::string& model_path, int expected_states) {
     if (!std::filesystem::exists(model_path)) {
         throw std::runtime_error("Whisper model not found: " + model_path +
                                   " (run scripts/setup_env.sh or download it from Settings)");
@@ -116,31 +119,42 @@ WhisperEngine::WhisperEngine(const std::string& model_path) {
     std::error_code ec;
     size_t model_bytes = static_cast<size_t>(std::filesystem::file_size(model_path, ec));
     if (!ec && cparams.use_gpu) {
-        GpuChoice choice = choose_gpu(model_bytes);
+        GpuChoice choice = choose_gpu(model_bytes, expected_states);
         if (choice.any_gpu && choice.device < 0) {
             // Loading anyway would abort inside ggml and kill the process.
             cparams.use_gpu = false;
             backend_note_ = "Not enough free VRAM for the Whisper model (" + format_mib(model_bytes) +
                             " model, " + format_mib(choice.best_free) +
                             " free) -- transcribing on CPU, which is slower. Free some GPU memory "
-                            "(e.g. let Ollama unload) and restart to use the GPU.";
+                            "(Settings > Unload now, or a shorter keep-alive) and reload to use the GPU.";
         } else if (choice.device >= 0) {
             cparams.gpu_device = choice.device;
         }
     }
 
-    ctx_ = whisper_init_from_file_with_params(model_path.c_str(), cparams);
+    // _no_state: the states are created per stream by WhisperEngine below.
+    ctx_ = whisper_init_from_file_with_params_no_state(model_path.c_str(), cparams);
     if (!ctx_) {
         throw std::runtime_error("Failed to load Whisper model: " + model_path);
     }
 }
 
-WhisperEngine::~WhisperEngine() {
+WhisperModel::~WhisperModel() {
     if (ctx_) whisper_free(ctx_);
 }
 
+WhisperEngine::WhisperEngine(std::shared_ptr<WhisperModel> model) : model_(std::move(model)) {
+    if (!model_ || !model_->raw()) throw std::runtime_error("Whisper model not loaded");
+    state_ = whisper_init_state(model_->raw());
+    if (!state_) throw std::runtime_error("Failed to allocate a Whisper inference state");
+}
+
+WhisperEngine::~WhisperEngine() {
+    if (state_) whisper_free_state(state_);
+}
+
 std::string WhisperEngine::transcribe(const std::vector<float>& audio) {
-    if (audio.empty() || !ctx_) return "";
+    if (audio.empty() || !state_) return "";
 
     whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     params.print_progress = false;
@@ -152,12 +166,12 @@ std::string WhisperEngine::transcribe(const std::vector<float>& audio) {
     params.n_threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
     params.language = detected_language_.empty() ? nullptr : detected_language_.c_str();
 
-    if (whisper_full(ctx_, params, audio.data(), static_cast<int>(audio.size())) != 0) {
+    if (whisper_full_with_state(model_->raw(), state_, params, audio.data(), static_cast<int>(audio.size())) != 0) {
         throw std::runtime_error("whisper_full failed");
     }
 
     if (detected_language_.empty()) {
-        int lang_id = whisper_full_lang_id(ctx_);
+        int lang_id = whisper_full_lang_id_from_state(state_);
         if (lang_id >= 0) {
             const char* lang = whisper_lang_str(lang_id);
             if (lang) detected_language_ = lang;
@@ -165,9 +179,9 @@ std::string WhisperEngine::transcribe(const std::vector<float>& audio) {
     }
 
     std::string text;
-    int n_segments = whisper_full_n_segments(ctx_);
+    int n_segments = whisper_full_n_segments_from_state(state_);
     for (int i = 0; i < n_segments; ++i) {
-        const char* seg = whisper_full_get_segment_text(ctx_, i);
+        const char* seg = whisper_full_get_segment_text_from_state(state_, i);
         if (!seg) continue;
         std::string s(seg);
         size_t start = s.find_first_not_of(' ');

@@ -43,6 +43,7 @@ public:
 
 private:
     mutable std::mutex whisper_mutex_;
+    std::shared_ptr<transcription::WhisperModel> whisper_model_;
     std::unique_ptr<transcription::WhisperEngine> mic_engine_;
     std::unique_ptr<transcription::WhisperEngine> monitor_engine_;
     std::string whisper_error_;

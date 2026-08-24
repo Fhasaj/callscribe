@@ -1,24 +1,49 @@
 #pragma once
 #include <whisper.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace callscribe::transcription {
 
-// Wraps a whisper.cpp context. whisper.cpp contexts are not safe for
-// concurrent whisper_full() calls from multiple threads on the SAME
-// instance, so the app creates one WhisperEngine per audio stream (mic,
-// monitor) -- each stream's worker thread owns its instance, and each holds
-// its own copy of the weights.
+// The model weights, loaded once and shared by every stream.
 //
-// Each instance picks GPU or CPU when it is constructed, based on the VRAM
-// actually free at that moment: ggml calls abort() if a device allocation
-// fails, which would take the whole app down with a core dump and no message,
-// so we check before asking rather than recovering after.
+// whisper.cpp separates the read-only context (weights) from the per-inference
+// state (KV cache, buffers). Concurrent whisper_full() calls are unsafe on one
+// *state*, not on one context -- so each audio stream gets its own state while
+// they all share these weights. Loading the file once per stream instead would
+// cost a second full copy of the model (~1.5 GB on `medium`).
+//
+// GPU or CPU is chosen when this is constructed, based on the VRAM actually
+// free at that moment: ggml calls abort() if a device allocation fails, which
+// would take the whole app down with a core dump and no message, so we check
+// before asking rather than recovering after.
+class WhisperModel {
+public:
+    // `expected_states` is how many concurrent streams will run off this model;
+    // each one needs its own working buffers on top of the shared weights, so
+    // the VRAM check has to account for all of them up front.
+    WhisperModel(const std::string& model_path, int expected_states);
+    ~WhisperModel();
+    WhisperModel(const WhisperModel&) = delete;
+    WhisperModel& operator=(const WhisperModel&) = delete;
+
+    whisper_context* raw() const { return ctx_; }
+
+    // Non-empty when the model had to fall back to CPU, explaining why.
+    const std::string& backend_note() const { return backend_note_; }
+
+private:
+    whisper_context* ctx_ = nullptr;
+    std::string backend_note_;
+};
+
+// One stream's inference state over a shared WhisperModel. Each instance is
+// owned by exactly one worker thread; two instances may run concurrently.
 class WhisperEngine {
 public:
-    explicit WhisperEngine(const std::string& model_path);
+    explicit WhisperEngine(std::shared_ptr<WhisperModel> model);
     ~WhisperEngine();
     WhisperEngine(const WhisperEngine&) = delete;
     WhisperEngine& operator=(const WhisperEngine&) = delete;
@@ -26,13 +51,12 @@ public:
     // audio must be mono float32 @ 16kHz in [-1, 1].
     std::string transcribe(const std::vector<float>& audio);
 
-    // Non-empty when this instance had to fall back to CPU, explaining why.
-    const std::string& backend_note() const { return backend_note_; }
+    const std::string& backend_note() const { return model_->backend_note(); }
 
 private:
-    whisper_context* ctx_ = nullptr;
+    std::shared_ptr<WhisperModel> model_;
+    whisper_state* state_ = nullptr;
     std::string detected_language_;
-    std::string backend_note_;
 };
 
 // True if whisper.cpp/ggml was compiled with a CUDA backend available.

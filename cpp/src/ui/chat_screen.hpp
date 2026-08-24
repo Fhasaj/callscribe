@@ -2,6 +2,7 @@
 #include <ftxui/component/component.hpp>
 #include <ftxui/dom/elements.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -33,6 +34,9 @@ public:
     ChatScreen& operator=(const ChatScreen&) = delete;
 
     ftxui::Component component() { return root_; }
+    // True while a reply is streaming in, so the render loop keeps ticking
+    // fast enough for the progress counters to move.
+    bool needs_fast_redraw() const { return streaming_.load(); }
 
 private:
     struct Message {
@@ -54,6 +58,9 @@ private:
     std::vector<Message> conversations_[kModeCount];
     std::string status_message_;
     bool sending_ = false;
+    // Mirrors sending_ for the render-loop ticker, which polls it every tick
+    // from another thread and shouldn't have to take mutex_ to do so.
+    std::atomic<bool> streaming_{false};
     std::chrono::steady_clock::time_point send_started_;
     llm::StreamProgress progress_;
     std::thread worker_;

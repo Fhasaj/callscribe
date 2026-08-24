@@ -241,6 +241,15 @@ void RecordScreen::build_ui() {
         if (!editable) {
             children.push_back(text("(fields locked while recording/processing)") | dim);
         }
+        // Only reachable when Whisper is running well behind realtime -- worth
+        // saying plainly, since the transcript is what the summary is built from.
+        if (size_t dropped = dropped_chunks(); dropped > 0) {
+            children.push_back(paragraph("Transcription is behind: " + std::to_string(dropped) +
+                                          " chunk(s) skipped in the live transcript. The full recording is "
+                                          "still saved. A smaller Whisper model, or freeing GPU memory in "
+                                          "Settings, will keep up.") |
+                                color(theme::kWarning));
+        }
         if (!error_copy.empty()) {
             children.push_back(text(error_copy) | color(theme::kDanger));
         }
@@ -419,11 +428,17 @@ void RecordScreen::finalize() {
 
     long long duration = recorded_seconds_;  // paused stretches excluded
 
-    size_t n = std::max(mic_audio.size(), monitor_audio.size());
-    std::vector<float> mixed(n, 0.0f);
-    for (size_t i = 0; i < mic_audio.size(); ++i) mixed[i] += mic_audio[i];
-    for (size_t i = 0; i < monitor_audio.size(); ++i) mixed[i] += monitor_audio[i];
-    for (auto& s : mixed) s = std::max(-1.0f, std::min(1.0f, s));
+    // Mix in place. Each capture buffer is ~230 MB per recorded hour, so
+    // allocating a third full-length buffer for the mix used to triple peak
+    // memory at exactly the point summarization also wants room. Instead the
+    // mic buffer is reused as the mix and each source is released the moment
+    // it has been folded in -- samples outside the monitor's range are already
+    // in [-1, 1] (they came from int16), so only the overlap needs clamping.
+    std::vector<float> mixed = std::move(mic_audio);
+    if (monitor_audio.size() > mixed.size()) mixed.resize(monitor_audio.size(), 0.0f);
+    for (size_t i = 0; i < monitor_audio.size(); ++i)
+        mixed[i] = std::max(-1.0f, std::min(1.0f, mixed[i] + monitor_audio[i]));
+    std::vector<float>().swap(monitor_audio);
 
     std::string wav_path = (recordings_dir() / ("call_" + std::to_string(call_id_) + ".wav")).string();
     try {
@@ -431,6 +446,8 @@ void RecordScreen::finalize() {
     } catch (const std::exception&) {
         wav_path.clear();
     }
+    // The audio is on disk now; summarizing takes minutes and doesn't need it.
+    std::vector<float>().swap(mixed);
 
     ctx_.repo->finish_call(call_id_, static_cast<int>(duration), wav_path, "summarizing");
 

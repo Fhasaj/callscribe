@@ -14,6 +14,7 @@
 namespace callscribe::ui {
 
 SettingsScreen::SettingsScreen(AppContext& ctx) : ctx_(ctx) {
+    ollama_keep_alive_ = ctx_.settings.ollama_keep_alive;
     user_display_name_ = ctx_.settings.user_display_name;
     db_path_ = ctx_.settings.db_path;
     reminder_time_ = ctx_.settings.reminder_time;
@@ -152,6 +153,14 @@ void SettingsScreen::pull_recommended() {
     });
 }
 
+void SettingsScreen::unload_now() {
+    llm::unload_model(ctx_.settings.ollama_host, ctx_.settings.ollama_model);
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    ollama_status_ = ctx_.settings.ollama_model.empty()
+                          ? "No model selected to unload."
+                          : ("Asked Ollama to unload " + ctx_.settings.ollama_model + ".");
+}
+
 void SettingsScreen::download_model() {
     std::string size = whisper_sizes_[whisper_size_selected_];
     if (download_thread_.joinable()) download_thread_.join();
@@ -182,6 +191,9 @@ void SettingsScreen::save() {
     ctx_.settings.monitor_source = (monitor_selected_ >= 0 && monitor_selected_ < static_cast<int>(monitor_names_.size()))
                                         ? monitor_names_[monitor_selected_]
                                         : "";
+    // Blank means "leave it to the server's OLLAMA_KEEP_ALIVE", which is the
+    // behaviour this setting exists to override -- so fall back to the default.
+    ctx_.settings.ollama_keep_alive = ollama_keep_alive_.empty() ? kDefaultOllamaKeepAlive : ollama_keep_alive_;
     ctx_.settings.user_display_name = user_display_name_.empty() ? kDefaultUserDisplayName : user_display_name_;
     bool db_path_changed = ctx_.settings.db_path != db_path_;
     ctx_.settings.db_path = db_path_;
@@ -210,6 +222,11 @@ void SettingsScreen::build_ui() {
     auto model_dropdown = Dropdown(&ollama_models_, &ollama_model_selected_);
     auto refresh_models_btn = Button("Refresh", [this] { refresh_models(); });
     auto pull_btn = Button(std::string("Pull ") + kRecommendedOllamaModel, [this] { pull_recommended(); });
+
+    InputOption keep_alive_opt = styled_input_option();
+    keep_alive_opt.multiline = false;
+    auto keep_alive_input = WrappedInput(&ollama_keep_alive_, kDefaultOllamaKeepAlive, keep_alive_opt);
+    auto unload_btn = Button("Unload now", [this] { unload_now(); });
 
     auto whisper_size_dropdown = Dropdown(&whisper_sizes_, &whisper_size_selected_);
     auto download_model_btn = Button("Download model", [this] { download_model(); });
@@ -267,6 +284,7 @@ void SettingsScreen::build_ui() {
 
     auto layout = Container::Vertical({
         Container::Horizontal({model_dropdown, refresh_models_btn, pull_btn}),
+        Container::Horizontal({keep_alive_input, unload_btn}),
         Container::Horizontal({whisper_size_dropdown, download_model_btn}),
         Container::Horizontal({mic_dropdown, monitor_dropdown}),
         Container::Horizontal({refresh_devices_btn, test_mic_btn, test_speaker_btn}),
@@ -281,7 +299,8 @@ void SettingsScreen::build_ui() {
         save_btn,
     });
 
-    root_ = Renderer(layout, [this, model_dropdown, refresh_models_btn, pull_btn, whisper_size_dropdown,
+    root_ = Renderer(layout, [this, model_dropdown, refresh_models_btn, pull_btn, keep_alive_input, unload_btn,
+                               whisper_size_dropdown,
                                download_model_btn, mic_dropdown, monitor_dropdown, refresh_devices_btn, test_mic_btn,
                                test_speaker_btn, name_input, db_input, reminder_checkbox, time_input, echo_cancel_checkbox,
                                summary_prompt_input, email_prompt_input, tasks_prompt_input, reset_prompts_btn,
@@ -320,6 +339,11 @@ void SettingsScreen::build_ui() {
         }));
         if (!ollama_status_copy.empty()) children.push_back(text(ollama_status_copy) | dim);
         if (pulling_now || !pull_status_copy.empty()) children.push_back(text(pull_status_copy) | dim);
+
+        children.push_back(hbox({text("Keep model loaded for: "), keep_alive_input->Render() | size(WIDTH, EQUAL, 10),
+                                  text(" "), unload_btn->Render()}));
+        children.push_back(text("  How long Ollama holds the model in memory after a call (10m, 1h, 0, -1).") | dim);
+        children.push_back(text("  Shorter frees VRAM for Whisper, which otherwise transcribes on CPU.") | dim);
 
         children.push_back(separator() | color(theme::kMuted));
         children.push_back(text("Whisper model size (" + cuda_note + "):") | bold | color(theme::kAccent));

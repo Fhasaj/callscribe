@@ -12,8 +12,20 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// Sets the `keep_alive` sent with every subsequent chat request -- how long
+// Ollama holds the model in (V)RAM once the reply is done. Set once at startup
+// and again whenever Settings is saved, rather than being threaded through
+// every call, since it is a single process-wide preference. Accepts Ollama's
+// duration format ("10m", "1h", "0", "-1"); an empty value omits the field and
+// lets the server's OLLAMA_KEEP_ALIVE decide.
+void set_keep_alive(const std::string& value);
+
 bool is_running(const std::string& host);
 std::vector<std::string> list_models(const std::string& host);
+
+// Asks Ollama to drop `model` from memory right now (keep_alive: 0), freeing
+// the VRAM for Whisper. Best-effort: a failure here is not worth surfacing.
+void unload_model(const std::string& host, const std::string& model) noexcept;
 void pull_model(const std::string& host, const std::string& model,
                  const std::function<void(const std::string&)>& on_progress = nullptr);
 

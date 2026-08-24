@@ -91,6 +91,12 @@ private:
     void stop_recording();
     void toggle_pause();
     long long elapsed_seconds() const;
+    // Combined across both streams; non-zero once transcription falls far
+    // enough behind that queued audio had to be discarded.
+    size_t dropped_chunks() const {
+        return (mic_capture_ ? mic_capture_->dropped_chunks() : 0) +
+               (monitor_capture_ ? monitor_capture_->dropped_chunks() : 0);
+    }
     void mic_worker_loop();
     void monitor_worker_loop();
     void finalize();

@@ -52,7 +52,9 @@ Spawned spawn_parec(const std::string& source) {
 }
 }  // namespace
 
-StreamCapture::StreamCapture(std::string source) : source_(std::move(source)) {}
+StreamCapture::StreamCapture(std::string source) : source_(std::move(source)) {
+    chunk_queue_.set_capacity(kMaxQueuedChunks);
+}
 
 StreamCapture::~StreamCapture() {
     if (pid_ > 0) stop();

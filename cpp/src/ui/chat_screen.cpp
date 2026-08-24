@@ -92,6 +92,7 @@ void ChatScreen::send() {
         progress_ = {};
         send_started_ = std::chrono::steady_clock::now();
         sending_ = true;
+        streaming_.store(true);
     }
     input_text_.clear();
 
@@ -127,6 +128,7 @@ void ChatScreen::send() {
             status_message_ = "Failed: " + error_text;
         }
         sending_ = false;
+        streaming_.store(false);
     });
 }
 

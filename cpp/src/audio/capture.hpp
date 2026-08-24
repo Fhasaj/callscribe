@@ -11,6 +11,14 @@ namespace callscribe::audio {
 inline constexpr int kSampleRate = 16000;
 inline constexpr double kChunkSeconds = 12.0;  // audio handed to Whisper per chunk
 
+// Cap on un-transcribed chunks held in memory. Whisper on a GPU runs faster
+// than realtime and never gets near this; on the CPU fallback it doesn't, and
+// the backlog would otherwise grow for the whole call (~770 KB per chunk).
+// 150 chunks is half an hour of slack, ~115 MB, past which the oldest are
+// dropped from the live transcript. The full recording is unaffected -- it is
+// accumulated separately and written to the WAV in one piece.
+inline constexpr size_t kMaxQueuedChunks = 150;
+
 // Captures one named PipeWire/PulseAudio source via `parec` (spawned
 // directly with fork/exec so we retain the child pid to terminate it),
 // converts to mono float32 @ 16kHz, and exposes ~kChunkSeconds chunks via
@@ -37,6 +45,10 @@ public:
 
     util::BlockingQueue<std::vector<float>>& chunks() { return chunk_queue_; }
 
+    // Chunks discarded because transcription couldn't keep up (see
+    // kMaxQueuedChunks). Non-zero means the live transcript has gaps.
+    size_t dropped_chunks() const { return chunk_queue_.dropped(); }
+
     // Live input level (RMS of the most recent ~100ms block, roughly 0..1),
     // updated ~10x/second -- for driving a near-instant level gauge in the UI.
     float current_level() const { return current_level_.load(); }
@@ -49,7 +61,7 @@ private:
 
     std::vector<float> full_audio_;
     std::vector<float> pending_;
-    util::BlockingQueue<std::vector<float>> chunk_queue_;
+    mutable util::BlockingQueue<std::vector<float>> chunk_queue_;
 
     std::atomic<float> current_level_{0.0f};
     std::atomic<bool> paused_{false};

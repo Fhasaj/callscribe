@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <mutex>
 
+#include "config.hpp"
+
 namespace callscribe::llm {
 
 namespace {
@@ -60,6 +62,21 @@ std::string http_post_json(const std::string& url, const std::string& json_body,
     curl_slist_free_all(headers);
     if (res != CURLE_OK) throw OllamaError(std::string("HTTP POST failed: ") + curl_easy_strerror(res));
     return body;
+}
+
+// Guarded because Settings can save it from the UI thread while a summarize
+// worker is mid-request on another.
+std::mutex& keep_alive_mutex() {
+    static std::mutex m;
+    return m;
+}
+std::string& keep_alive_value() {
+    static std::string value = kDefaultOllamaKeepAlive;
+    return value;
+}
+std::string current_keep_alive() {
+    std::lock_guard<std::mutex> lock(keep_alive_mutex());
+    return keep_alive_value();
 }
 
 std::string trim(const std::string& s) {
@@ -179,6 +196,9 @@ ChatReply chat(const std::string& host, const std::string& model, const std::str
                           {"messages", nlohmann::json::array({{{"role", "user"}, {"content", prompt}}})},
                           {"stream", true}};
     if (json_mode) req["format"] = "json";
+    // Sent per-request so it wins over the server's OLLAMA_KEEP_ALIVE: a model
+    // parked in VRAM is memory Whisper can't have.
+    if (std::string ka = current_keep_alive(); !ka.empty()) req["keep_alive"] = ka;
     // Without an explicit num_ctx, Ollama applies its own small default and
     // silently drops everything past it -- a long transcript comes back
     // summarized from the handful of tokens that survived, with no error.
@@ -274,6 +294,23 @@ size_t pull_write_callback(char* ptr, size_t size, size_t nmemb, void* userdata)
 }
 
 }  // namespace
+
+void set_keep_alive(const std::string& value) {
+    std::lock_guard<std::mutex> lock(keep_alive_mutex());
+    keep_alive_value() = value;
+}
+
+void unload_model(const std::string& host, const std::string& model) noexcept {
+    if (model.empty()) return;
+    // An empty prompt with keep_alive 0 is Ollama's documented way to evict a
+    // model without generating anything.
+    nlohmann::json req = {{"model", model}, {"prompt", ""}, {"keep_alive", 0}};
+    try {
+        http_post_json(host + "/api/generate", req.dump(), 10);
+    } catch (const OllamaError&) {
+        // Nothing useful to do -- the model stays loaded until it times out.
+    }
+}
 
 bool is_running(const std::string& host) {
     try {

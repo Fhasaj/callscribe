@@ -6,6 +6,13 @@ namespace callscribe {
 
 inline const char* kOllamaHostDefault = "http://localhost:11434";
 inline const char* kRecommendedOllamaModel = "qwen2.5:7b-instruct";
+// How long Ollama keeps the model resident after a call finishes. Sent with
+// every request, so it overrides whatever OLLAMA_KEEP_ALIVE the server was
+// started with. This is deliberately short: a model left loaded holds onto the
+// VRAM that WhisperEngine needs, and Whisper silently falls back to (much
+// slower) CPU transcription when it can't find room. Ollama's own format --
+// "10m", "1h", "0" to unload immediately, "-1" to keep forever.
+inline const char* kDefaultOllamaKeepAlive = "10m";
 inline const char* kDefaultUserDisplayName = "Fatlum Hasaj";
 inline const char* kDefaultOtherSpeakerLabel = "Other";
 
@@ -31,6 +38,7 @@ struct Settings {
     std::string db_path;
     std::string ollama_host = kOllamaHostDefault;
     std::string ollama_model;          // empty = not chosen yet, pick in Settings screen
+    std::string ollama_keep_alive = kDefaultOllamaKeepAlive;
     std::string whisper_model_size;    // empty = auto-suggest ("small" CPU / "medium" CUDA)
     std::string mic_source;            // empty = system default source
     std::string monitor_source;        // empty = "<default-sink>.monitor"

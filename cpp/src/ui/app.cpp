@@ -417,16 +417,26 @@ int run(AppContext& ctx) {
 
     // 80ms redraw tick -- fast enough that the recording/test level gauges
     // (updated ~10x/sec by StreamCapture) read as live rather than jumpy.
-    constexpr auto kTickInterval = std::chrono::milliseconds(80);
+    //
+    // Nothing on screen moves on its own the rest of the time, so idling at
+    // that rate meant re-rendering the whole component tree 12.5x/second
+    // forever. The slow tick still refreshes anything a background thread
+    // changed (a finished summary, a fired reminder) without the constant
+    // wakeups; screens with live output opt back into the fast one.
+    constexpr auto kFastTick = std::chrono::milliseconds(80);
+    constexpr auto kIdleTick = std::chrono::milliseconds(500);
 
     std::atomic<bool> ticking{true};
     std::thread ticker([&] {
-        int since_task_check = 0;
+        auto elapsed_since_task_check = std::chrono::milliseconds(0);
         while (ticking) {
-            std::this_thread::sleep_for(kTickInterval);
+            const bool live = record.is_recording() || settings.needs_fast_redraw() || chat.needs_fast_redraw();
+            const auto interval = live ? kFastTick : kIdleTick;
+            std::this_thread::sleep_for(interval);
             if (!ticking) break;
-            if (++since_task_check >= 13) {  // ~once a second
-                since_task_check = 0;
+            elapsed_since_task_check += interval;
+            if (elapsed_since_task_check >= std::chrono::seconds(1)) {
+                elapsed_since_task_check = std::chrono::milliseconds(0);
                 std::string today = util::today_iso();
                 int count = 0;
                 for (auto& t : ctx.repo->list_tasks("open")) {

@@ -53,6 +53,12 @@ Settings load_settings() {
     if (j.contains("db_path")) s.db_path = j.at("db_path").get<std::string>();
     if (j.contains("ollama_host")) s.ollama_host = j.at("ollama_host").get<std::string>();
     if (j.contains("ollama_model")) s.ollama_model = j.at("ollama_model").get<std::string>();
+    // An empty value would mean "send no keep_alive at all", handing control
+    // back to the server's env var -- keep the default instead.
+    if (j.contains("ollama_keep_alive") && j.at("ollama_keep_alive").is_string()) {
+        std::string v = j.at("ollama_keep_alive").get<std::string>();
+        if (!v.empty()) s.ollama_keep_alive = v;
+    }
     if (j.contains("whisper_model_size")) s.whisper_model_size = j.at("whisper_model_size").get<std::string>();
     if (j.contains("mic_source")) s.mic_source = j.at("mic_source").get<std::string>();
     if (j.contains("monitor_source")) s.monitor_source = j.at("monitor_source").get<std::string>();
@@ -88,6 +94,7 @@ void save_settings(const Settings& s) {
     j["db_path"] = s.db_path;
     j["ollama_host"] = s.ollama_host;
     j["ollama_model"] = s.ollama_model;
+    j["ollama_keep_alive"] = s.ollama_keep_alive;
     j["whisper_model_size"] = s.whisper_model_size;
     j["mic_source"] = s.mic_source;
     j["monitor_source"] = s.monitor_source;

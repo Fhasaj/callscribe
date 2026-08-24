@@ -35,11 +35,25 @@ void write_wav_mono16(const std::string& path, const std::vector<float>& samples
     out.write("data", 4);
     write_u32(out, data_bytes);
 
+    // Convert and write in blocks. One ofstream::write per sample is ~58
+    // million calls for an hour of audio; buffering the whole file as int16
+    // first would instead add another full-length allocation, which is what
+    // this writer is called from finalize() to avoid.
+    constexpr size_t kBlockSamples = 8192;
+    std::vector<int16_t> block;
+    block.reserve(kBlockSamples);
+    auto flush_block = [&out, &block] {
+        if (block.empty()) return;
+        out.write(reinterpret_cast<const char*>(block.data()),
+                  static_cast<std::streamsize>(block.size() * sizeof(int16_t)));
+        block.clear();
+    };
     for (float sample : samples) {
         float clamped = std::max(-1.0f, std::min(1.0f, sample));
-        int16_t pcm = static_cast<int16_t>(clamped * 32767.0f);
-        out.write(reinterpret_cast<const char*>(&pcm), 2);
+        block.push_back(static_cast<int16_t>(clamped * 32767.0f));
+        if (block.size() == kBlockSamples) flush_block();
     }
+    flush_block();
 }
 
 }  // namespace callscribe::util
