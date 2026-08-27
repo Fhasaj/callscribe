@@ -15,7 +15,10 @@
 
 namespace callscribe::ui {
 
-HistoryScreen::HistoryScreen(AppContext& ctx) : ctx_(ctx) {
+HistoryScreen::HistoryScreen(AppContext& ctx)
+    : ctx_(ctx), proposed_tasks_(ctx, [this] {
+          return (selected_ >= 0 && selected_ < static_cast<int>(calls_.size())) ? calls_[selected_].id : -1;
+      }) {
     refresh_list();
     build_ui();
 }
@@ -76,9 +79,12 @@ void HistoryScreen::load_detail() {
 }
 
 void HistoryScreen::refresh_linked_tasks() {
-    linked_tasks_ = (selected_ >= 0 && selected_ < static_cast<int>(calls_.size()))
-                        ? ctx_.repo->list_tasks_for_call(calls_[selected_].id)
-                        : std::vector<db::Task>{};
+    linked_tasks_.clear();
+    if (selected_ >= 0 && selected_ < static_cast<int>(calls_.size())) {
+        // Proposed ones belong to the review panel, not this list.
+        for (auto& task : ctx_.repo->list_tasks_for_call(calls_[selected_].id))
+            if (task.status != db::kStatusProposed) linked_tasks_.push_back(std::move(task));
+    }
     linked_tasks_dirty_ = false;
 }
 
@@ -128,7 +134,9 @@ void HistoryScreen::regenerate() {
                 std::optional<int64_t> task_customer = call.customer_id;
                 if (!t.customer.empty() && t.customer != call.customer_name)
                     task_customer = ctx_.repo->get_or_create_customer(t.customer);
-                ctx_.repo->add_task(t.description, call.id, task_customer, t.due_date, "call", t.priority);
+                // Proposed, not open -- see the review panel under the summary.
+                ctx_.repo->add_task(t.description, call.id, task_customer, t.due_date, "call", t.priority,
+                                     db::kStatusProposed);
             }
             linked_tasks_dirty_ = true;
             ctx_.repo->add_note(call.id, result.summary_text, result.email_draft, "[]");
@@ -226,9 +234,11 @@ void HistoryScreen::build_ui() {
         },
         "(no summary yet)");
 
+    auto proposed_panel = proposed_tasks_.component();
     auto summary_page =
-        Renderer(Container::Vertical({summary_pane, regen_button, copy_summary_btn, new_task_input, add_task_btn}),
-                 [this, summary_pane, regen_button, copy_summary_btn, new_task_input, add_task_btn] {
+        Renderer(Container::Vertical({summary_pane, regen_button, copy_summary_btn, proposed_panel, new_task_input,
+                                       add_task_btn}),
+                 [this, summary_pane, regen_button, copy_summary_btn, proposed_panel, new_task_input, add_task_btn] {
                      if (linked_tasks_dirty_.load()) refresh_linked_tasks();
 
                      std::string status_copy;
@@ -244,12 +254,16 @@ void HistoryScreen::build_ui() {
                          hbox({regen_button->Render(), text(" "), copy_summary_btn->Render()}));
                      if (regen_in_progress) children.push_back(text("Working...") | color(theme::kWarning));
                      if (!status_copy.empty()) children.push_back(text(status_copy) | dim);
+                     if (!proposed_tasks_.empty()) {
+                         children.push_back(separator() | color(theme::kMuted));
+                         children.push_back(proposed_panel->Render());
+                     }
 
                      Elements task_lines;
                      for (auto& t : linked_tasks_) {
-                         bool done = t.status == "done";
+                         bool done = t.status == db::kStatusDone;
                          std::string line = (done ? "[x] " : "[ ] ") + t.description;
-                         if (t.source == "call") line += "  [auto]";
+                         if (t.source == "call") line += "  [from summary]";
                          Element e = text(line);
                          if (done) e |= color(theme::kMuted);
                          task_lines.push_back(e);

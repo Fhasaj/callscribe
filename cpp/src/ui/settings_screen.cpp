@@ -2,9 +2,13 @@
 
 #include <ftxui/dom/elements.hpp>
 
+#include <algorithm>
+#include <cstdio>
+
 #include "audio/devices.hpp"
 #include "config.hpp"
 #include "llm/ollama_client.hpp"
+#include "transcription/diarizer.hpp"
 #include "transcription/whisper_engine.hpp"
 #include "ui/level_meter.hpp"
 #include "ui/styled_input.hpp"
@@ -13,13 +17,44 @@
 
 namespace callscribe::ui {
 
+namespace {
+
+std::string format_bytes(int64_t bytes) {
+    char buf[32];
+    if (bytes >= 1024 * 1024)
+        std::snprintf(buf, sizeof(buf), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+    else
+        std::snprintf(buf, sizeof(buf), "%.0f KB", static_cast<double>(bytes) / 1024.0);
+    return buf;
+}
+
+// A progress bar for one transfer. Servers do not always send a content
+// length, so "how far along" is not always answerable -- in that case the
+// bytes so far are shown on their own rather than a bar pretending to know.
+ftxui::Element download_progress(int64_t done, int64_t total) {
+    using namespace ftxui;
+    if (total <= 0) return text("  " + format_bytes(done) + " downloaded...") | color(theme::kAccent);
+    float fraction = std::min(1.0f, static_cast<float>(done) / static_cast<float>(total));
+    return hbox({
+        text("  "),
+        gauge(fraction) | color(theme::kAccent) | size(WIDTH, EQUAL, 30),
+        text(" " + std::to_string(static_cast<int>(fraction * 100)) + "%  ") | color(theme::kAccent),
+        text(format_bytes(done) + " / " + format_bytes(total)) | dim,
+    });
+}
+
+}  // namespace
+
 SettingsScreen::SettingsScreen(AppContext& ctx) : ctx_(ctx) {
     ollama_keep_alive_ = ctx_.settings.ollama_keep_alive;
+    ollama_unload_after_use_ = ctx_.settings.ollama_unload_after_use;
     user_display_name_ = ctx_.settings.user_display_name;
     db_path_ = ctx_.settings.db_path;
     reminder_time_ = ctx_.settings.reminder_time;
     reminder_enabled_ = ctx_.settings.reminder_enabled;
     echo_cancel_ = ctx_.settings.echo_cancel;
+    detect_speaker_turns_ = ctx_.settings.detect_speaker_turns;
+    diarize_far_end_ = ctx_.settings.diarize_far_end;
     summary_prompt_ = ctx_.settings.summary_prompt;
     email_prompt_ = ctx_.settings.email_prompt;
     tasks_prompt_ = ctx_.settings.tasks_prompt;
@@ -39,6 +74,7 @@ SettingsScreen::~SettingsScreen() {
     stop_test();
     if (pull_thread_.joinable()) pull_thread_.join();
     if (download_thread_.joinable()) download_thread_.join();
+    if (diarization_download_thread_.joinable()) diarization_download_thread_.join();
 }
 
 void SettingsScreen::refresh_models() {
@@ -162,22 +198,80 @@ void SettingsScreen::unload_now() {
 }
 
 void SettingsScreen::download_model() {
+    if (downloading_.load()) return;
     std::string size = whisper_sizes_[whisper_size_selected_];
+    if (transcription::model_present(size)) return;
     if (download_thread_.joinable()) download_thread_.join();
+
+    downloading_ = true;
+    whisper_bytes_ = 0;
+    whisper_bytes_total_ = 0;
     {
         std::lock_guard<std::mutex> lock(status_mutex_);
-        downloading_ = true;
         whisper_status_ = "Downloading ggml-" + size + ".bin...";
     }
     download_thread_ = std::thread([this, size] {
-        std::lock_guard<std::mutex> lock(status_mutex_);
+        std::string status;
         try {
-            transcription::ensure_model_downloaded(size);
-            whisper_status_ = "Download complete.";
+            // The lock is taken only to publish the final message. Holding it
+            // across the transfer would block every render for the length of
+            // the download -- the renderer takes this same mutex -- which is
+            // exactly the freeze a progress bar is supposed to rule out.
+            transcription::ensure_model_downloaded(size, [this](int64_t done, int64_t total) {
+                whisper_bytes_.store(done);
+                whisper_bytes_total_.store(total);
+            });
+            status = "Download complete.";
         } catch (const std::exception& e) {
-            whisper_status_ = std::string("Download failed: ") + e.what();
+            status = std::string("Download failed: ") + e.what();
+        }
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            whisper_status_ = status;
         }
         downloading_ = false;
+    });
+}
+
+void SettingsScreen::download_diarization_models() {
+    if (downloading_diarization_.load()) return;
+    if (transcription::diarization_models_present()) return;
+    if (diarization_download_thread_.joinable()) diarization_download_thread_.join();
+
+    downloading_diarization_ = true;
+    diarization_bytes_ = 0;
+    diarization_bytes_total_ = 0;
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        diarization_status_ = "Downloading speaker models (" +
+                               transcription::diarization_models_size_note() + ")...";
+        diarization_file_label_.clear();
+    }
+    diarization_download_thread_ = std::thread([this] {
+        std::string status;
+        try {
+            transcription::ensure_diarization_models_downloaded(
+                [this](const std::string& label, int index, int count, int64_t done, int64_t total) {
+                    diarization_bytes_.store(done);
+                    diarization_bytes_total_.store(total);
+                    // The label only changes when the file does, so the string
+                    // (and its lock) is touched once per file rather than on
+                    // every progress tick.
+                    std::string next = label + " (" + std::to_string(index) + " of " +
+                                        std::to_string(count) + ")";
+                    std::lock_guard<std::mutex> lock(status_mutex_);
+                    if (diarization_file_label_ != next) diarization_file_label_ = next;
+                });
+            status = "Speaker models ready.";
+        } catch (const std::exception& e) {
+            status = std::string("Download failed: ") + e.what();
+        }
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            diarization_status_ = status;
+            diarization_file_label_.clear();
+        }
+        downloading_diarization_ = false;
     });
 }
 
@@ -186,6 +280,8 @@ void SettingsScreen::save() {
                                       ? ollama_models_[ollama_model_selected_]
                                       : "";
     ctx_.settings.whisper_model_size = whisper_sizes_[whisper_size_selected_];
+    ctx_.settings.detect_speaker_turns = detect_speaker_turns_;
+    ctx_.settings.diarize_far_end = diarize_far_end_;
     ctx_.settings.mic_source =
         (mic_selected_ >= 0 && mic_selected_ < static_cast<int>(mic_names_.size())) ? mic_names_[mic_selected_] : "";
     ctx_.settings.monitor_source = (monitor_selected_ >= 0 && monitor_selected_ < static_cast<int>(monitor_names_.size()))
@@ -194,6 +290,7 @@ void SettingsScreen::save() {
     // Blank means "leave it to the server's OLLAMA_KEEP_ALIVE", which is the
     // behaviour this setting exists to override -- so fall back to the default.
     ctx_.settings.ollama_keep_alive = ollama_keep_alive_.empty() ? kDefaultOllamaKeepAlive : ollama_keep_alive_;
+    ctx_.settings.ollama_unload_after_use = ollama_unload_after_use_;
     ctx_.settings.user_display_name = user_display_name_.empty() ? kDefaultUserDisplayName : user_display_name_;
     bool db_path_changed = ctx_.settings.db_path != db_path_;
     ctx_.settings.db_path = db_path_;
@@ -227,9 +324,17 @@ void SettingsScreen::build_ui() {
     keep_alive_opt.multiline = false;
     auto keep_alive_input = WrappedInput(&ollama_keep_alive_, kDefaultOllamaKeepAlive, keep_alive_opt);
     auto unload_btn = Button("Unload now", [this] { unload_now(); });
+    auto unload_after_use_checkbox =
+        Checkbox("Unload the model as soon as each summary or reply is done", &ollama_unload_after_use_);
 
     auto whisper_size_dropdown = Dropdown(&whisper_sizes_, &whisper_size_selected_);
     auto download_model_btn = Button("Download model", [this] { download_model(); });
+    auto speaker_turns_checkbox =
+        Checkbox("Split the far end into speaker turns (tinydiarize)", &detect_speaker_turns_);
+    auto diarize_checkbox =
+        Checkbox("Identify far-end speakers after the call (recommended)", &diarize_far_end_);
+    auto download_diarization_btn =
+        Button("Download speaker models", [this] { download_diarization_models(); });
 
     auto mic_dropdown = Dropdown(&mic_labels_, &mic_selected_);
     auto monitor_dropdown = Dropdown(&monitor_labels_, &monitor_selected_);
@@ -285,7 +390,19 @@ void SettingsScreen::build_ui() {
     auto layout = Container::Vertical({
         Container::Horizontal({model_dropdown, refresh_models_btn, pull_btn}),
         Container::Horizontal({keep_alive_input, unload_btn}),
-        Container::Horizontal({whisper_size_dropdown, download_model_btn}),
+        unload_after_use_checkbox,
+        // Maybe, so a button that isn't drawn (already installed, or a
+        // download in flight) also stops being a Tab stop.
+        Container::Horizontal({whisper_size_dropdown, Maybe(download_model_btn, [this] {
+                                    return !downloading_.load() &&
+                                            !transcription::model_present(
+                                                whisper_sizes_[whisper_size_selected_]);
+                                })}),
+        speaker_turns_checkbox,
+        Container::Horizontal({diarize_checkbox, Maybe(download_diarization_btn, [this] {
+                                    return !downloading_diarization_.load() &&
+                                            !transcription::diarization_models_present();
+                                })}),
         Container::Horizontal({mic_dropdown, monitor_dropdown}),
         Container::Horizontal({refresh_devices_btn, test_mic_btn, test_speaker_btn}),
         name_input,
@@ -300,8 +417,10 @@ void SettingsScreen::build_ui() {
     });
 
     root_ = Renderer(layout, [this, model_dropdown, refresh_models_btn, pull_btn, keep_alive_input, unload_btn,
+                              unload_after_use_checkbox,
                                whisper_size_dropdown,
-                               download_model_btn, mic_dropdown, monitor_dropdown, refresh_devices_btn, test_mic_btn,
+                               download_model_btn, speaker_turns_checkbox, diarize_checkbox,
+                               download_diarization_btn, mic_dropdown, monitor_dropdown, refresh_devices_btn, test_mic_btn,
                                test_speaker_btn, name_input, db_input, reminder_checkbox, time_input, echo_cancel_checkbox,
                                summary_prompt_input, email_prompt_input, tasks_prompt_input, reset_prompts_btn,
                                save_btn] {
@@ -312,13 +431,23 @@ void SettingsScreen::build_ui() {
             stop_test();  // safety timeout so a forgotten test doesn't keep capturing forever
         }
 
-        std::string ollama_status_copy, pull_status_copy, whisper_status_copy;
+        // Read once per frame: diarization_models_present() and model_present()
+        // both stat the filesystem, and each is asked about more than once below.
+        const bool diarization_installed = transcription::diarization_models_present();
+        const bool downloading_diarization_now = downloading_diarization_.load();
+        const bool whisper_model_installed =
+            transcription::model_present(whisper_sizes_[whisper_size_selected_]);
+
+        std::string ollama_status_copy, pull_status_copy, whisper_status_copy, diarization_status_copy;
+        std::string diarization_file_copy;
         bool pulling_now, downloading_now;
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             ollama_status_copy = ollama_status_;
             pull_status_copy = pull_status_;
             whisper_status_copy = whisper_status_;
+            diarization_status_copy = diarization_status_;
+            diarization_file_copy = diarization_file_label_;
             pulling_now = pulling_;
             downloading_now = downloading_;
         }
@@ -344,11 +473,66 @@ void SettingsScreen::build_ui() {
                                   text(" "), unload_btn->Render()}));
         children.push_back(text("  How long Ollama holds the model in memory after a call (10m, 1h, 0, -1).") | dim);
         children.push_back(text("  Shorter frees VRAM for Whisper, which otherwise transcribes on CPU.") | dim);
+        children.push_back(unload_after_use_checkbox->Render());
+        children.push_back(text("  On: the model is loaded for the job and dropped straight after, so it never") | dim);
+        children.push_back(text("  sits alongside Whisper or another Ollama client. Costs a reload each time.") | dim);
 
         children.push_back(separator() | color(theme::kMuted));
         children.push_back(text("Whisper model size (" + cuda_note + "):") | bold | color(theme::kAccent));
-        children.push_back(hbox({whisper_size_dropdown->Render(), text(" "), download_model_btn->Render()}));
-        if (downloading_now || !whisper_status_copy.empty()) children.push_back(text(whisper_status_copy) | dim);
+        Elements whisper_row = {whisper_size_dropdown->Render(), text(" ")};
+        if (downloading_now)
+            whisper_row.push_back(text(" Downloading... ") | color(theme::kWarning));
+        else if (whisper_model_installed)
+            whisper_row.push_back(text(" ✓ Installed ") | color(theme::kSuccess));
+        else
+            whisper_row.push_back(download_model_btn->Render());
+        children.push_back(hbox(std::move(whisper_row)));
+        if (downloading_now)
+            children.push_back(download_progress(whisper_bytes_.load(), whisper_bytes_total_.load()));
+        if (!whisper_status_copy.empty()) children.push_back(text(whisper_status_copy) | dim);
+
+        // Diarization first: it is the better answer for "who said that", works
+        // with any Whisper model, and the tinydiarize option below is the
+        // fallback for wanting it live rather than after the call.
+        children.push_back(separator() | color(theme::kMuted));
+        children.push_back(text("Speaker identification (far end):") | bold | color(theme::kAccent));
+        Elements diarize_row = {diarize_checkbox->Render(), text("  ")};
+        if (downloading_diarization_now)
+            diarize_row.push_back(text(" Downloading... ") | color(theme::kWarning));
+        else if (diarization_installed)
+            diarize_row.push_back(text(" ✓ Installed ") | color(theme::kSuccess));
+        else
+            diarize_row.push_back(download_diarization_btn->Render());
+        children.push_back(hbox(std::move(diarize_row)));
+        if (downloading_diarization_now) {
+            if (!diarization_file_copy.empty())
+                children.push_back(text("  " + diarization_file_copy) | color(theme::kAccent));
+            children.push_back(download_progress(diarization_bytes_.load(), diarization_bytes_total_.load()));
+        }
+        children.push_back(text("  Runs two small models over the call recording when it ends and rewrites") | dim);
+        children.push_back(text("  the far-end names. Local, no account, nothing uploaded. Participants are") | dim);
+        children.push_back(text("  matched in the order they first speak; extra voices become Speaker 2, 3...") | dim);
+        if (!diarization_installed && !downloading_diarization_now)
+            children.push_back(text("  Models not downloaded yet (" +
+                                     transcription::diarization_models_size_note() + ").") |
+                                color(theme::kWarning));
+        if (!diarization_status_copy.empty()) children.push_back(text("  " + diarization_status_copy) | dim);
+
+        children.push_back(separator() | color(theme::kMuted));
+        children.push_back(speaker_turns_checkbox->Render());
+        // Said plainly, because the feature is easy to over-read: it marks that
+        // the voice changed, and the participant list supplies names in the
+        // order people first speak. It cannot recognise who is talking.
+        if (transcription::model_supports_speaker_turns(whisper_sizes_[whisper_size_selected_])) {
+            children.push_back(text("  Marks where the far-end speaker changes; participants are named in the") | dim);
+            children.push_back(text("  order they first speak, then Speaker 2, Speaker 3, ... It does not") | dim);
+            children.push_back(text("  recognise voices, and small.en-tdrz is English-only.") | dim);
+        } else {
+            children.push_back(text("  Needs the small.en-tdrz model above -- no other model can do this.") |
+                                color(theme::kWarning));
+            children.push_back(text("  That model is an English-only 'small', so it transcribes less accurately") | dim);
+            children.push_back(text("  than medium/large. Your own mic is a separate stream either way.") | dim);
+        }
 
         children.push_back(separator() | color(theme::kMuted));
         children.push_back(text("Audio sources:") | bold | color(theme::kAccent));

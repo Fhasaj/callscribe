@@ -20,6 +20,38 @@ public:
 // lets the server's OLLAMA_KEEP_ALIVE decide.
 void set_keep_alive(const std::string& value);
 
+// Whether a model is evicted from memory as soon as the operation that needed
+// it is done (see ModelSession). Set from Settings the same way keep_alive is.
+void set_unload_after_use(bool value);
+
+// Keeps a model resident for the span of one logical operation, then hands the
+// memory back.
+//
+// Summarizing is not one request but a chain of them -- a dozen map calls over
+// a long transcript, then the reduce -- so evicting after each reply would pay
+// the load cost over and over. Instead the whole operation is one session:
+// keep_alive bridges the gaps inside it, and the last session to close asks
+// Ollama to drop the model immediately.
+//
+// This matters because callscribe is not the only thing on the machine wanting
+// VRAM: Whisper needs room to transcribe, and any other Ollama client (an
+// editor, an agent) is loading its own weights alongside ours. A summary model
+// parked for keep_alive minutes after the work is done is memory nobody can
+// use. Sessions nest and refcount, so overlapping operations on the same model
+// only unload once, when the last one finishes.
+class ModelSession {
+public:
+    ModelSession(std::string host, std::string model);
+    ~ModelSession();
+    ModelSession(const ModelSession&) = delete;
+    ModelSession& operator=(const ModelSession&) = delete;
+
+private:
+    std::string host_;
+    std::string model_;
+    bool active_ = false;
+};
+
 bool is_running(const std::string& host);
 std::vector<std::string> list_models(const std::string& host);
 

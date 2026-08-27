@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
     seq INTEGER NOT NULL,
     speaker TEXT NOT NULL,
     text TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    start_ms INTEGER NOT NULL DEFAULT 0,
+    end_ms INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS notes (
@@ -92,6 +94,13 @@ Database::Database(const std::string& path) {
     sqlite3_exec(db_, "ALTER TABLE calls ADD COLUMN manual_notes TEXT", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'", nullptr, nullptr,
                  nullptr);
+    // Where each line sits in the recording. Needed to line the transcript up
+    // against speaker diarization, which reports its findings as time ranges.
+    // Older rows keep 0/0 and are simply never re-labelled.
+    sqlite3_exec(db_, "ALTER TABLE transcript_segments ADD COLUMN start_ms INTEGER NOT NULL DEFAULT 0", nullptr,
+                 nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE transcript_segments ADD COLUMN end_ms INTEGER NOT NULL DEFAULT 0", nullptr,
+                 nullptr, nullptr);
 }
 
 Database::~Database() {

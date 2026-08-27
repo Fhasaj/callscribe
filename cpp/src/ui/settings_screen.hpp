@@ -24,7 +24,11 @@ public:
     ftxui::Component component() { return root_; }
     // True while a mic/speaker test is running its live level gauge, which
     // needs the fast redraw tick to look smooth.
-    bool needs_fast_redraw() const { return testing_.load(); }
+    // A running download animates a progress bar, so it wants the fast tick
+    // for the same reason a live level meter does.
+    bool needs_fast_redraw() const {
+        return testing_.load() || downloading_.load() || downloading_diarization_.load();
+    }
 
 private:
     AppContext& ctx_;
@@ -33,8 +37,13 @@ private:
     int ollama_model_selected_ = 0;
     std::atomic<bool> models_need_refresh_{false};
 
-    std::vector<std::string> whisper_sizes_ = {"tiny", "base", "small", "medium", "large-v3"};
+    // small.en-tdrz is the odd one out: an English-only `small` that is the
+    // only model whisper.cpp can detect speaker turns with (see
+    // detect_speaker_turns_ below).
+    std::vector<std::string> whisper_sizes_ = {"tiny", "base", "small", "medium", "large-v3", "small.en-tdrz"};
     int whisper_size_selected_ = 2;
+    bool detect_speaker_turns_ = false;
+    bool diarize_far_end_ = false;
 
     std::vector<std::string> mic_labels_;
     std::vector<std::string> mic_names_;
@@ -44,6 +53,7 @@ private:
     int monitor_selected_ = 0;
 
     std::string ollama_keep_alive_;
+    bool ollama_unload_after_use_ = true;
     std::string user_display_name_;
     std::string db_path_;
     std::string reminder_time_;
@@ -60,9 +70,26 @@ private:
     std::string pull_status_;
     std::string whisper_status_;
     bool pulling_ = false;
-    bool downloading_ = false;
+    // Atomic because needs_fast_redraw() is called from the ticker thread.
+    std::atomic<bool> downloading_{false};
     std::thread pull_thread_;
     std::thread download_thread_;
+    std::thread diarization_download_thread_;
+    std::atomic<bool> downloading_diarization_{false};
+    std::string diarization_status_;
+
+    // Live transfer counters, written from the download threads and read by
+    // the renderer -- atomics rather than status_mutex_ so a progress tick
+    // (which fires many times a second) never contends with the status text.
+    // `total` is 0 until the server reports a content length, and stays 0 if
+    // it never does; the renderer shows bytes-so-far in that case rather than
+    // a meaningless percentage.
+    std::atomic<int64_t> whisper_bytes_{0};
+    std::atomic<int64_t> whisper_bytes_total_{0};
+    std::atomic<int64_t> diarization_bytes_{0};
+    std::atomic<int64_t> diarization_bytes_total_{0};
+    // "speaker embeddings (2 of 2)" -- which file of the pair is in flight.
+    std::string diarization_file_label_;
 
     // Mic/Speaker test: a throwaway StreamCapture on the currently selected
     // source, read for its live level only (nothing transcribed/saved).
@@ -78,6 +105,7 @@ private:
     void pull_recommended();
     void unload_now();
     void download_model();
+    void download_diarization_models();
     void start_mic_test();
     void start_monitor_test();
     void stop_test();

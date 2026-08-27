@@ -282,6 +282,9 @@ CallSummaryResult summarize_call(const std::string& host, const std::string& mod
                                   const std::string& participants, const std::string& call_date,
                                   const std::function<void(const std::string&)>& on_progress,
                                   const PromptPresets& prompts) {
+    // One session for the whole map/reduce chain below: the model stays loaded
+    // between the chunk calls and the final summary, then goes away.
+    ModelSession session(host, model);
     // Leave room for the instructions and metadata that wrap the transcript.
     const size_t budget = static_cast<size_t>(max_prompt_chars()) - 4096;
     std::string body = transcript;
@@ -332,6 +335,7 @@ std::string generate_yearly_narrative(const std::string& host, const std::string
                                        const db::YearlyStats& stats) {
     std::string prompt = build_yearly_narrative_prompt(year, stats.summaries, stats.call_count, stats.total_seconds,
                                                          stats.tasks_completed, stats.top_customers);
+    ModelSession session(host, model);
     return generate_text(host, model, prompt);
 }
 
@@ -340,17 +344,23 @@ std::string generate_review_report(const std::string& host, const std::string& m
                                     const db::YearlyStats& stats) {
     std::string prompt = build_review_report_prompt(year, cycle_label, questions, stats.summaries, stats.call_count,
                                                      stats.total_seconds, stats.tasks_completed, stats.top_customers);
+    ModelSession session(host, model);
     return generate_text(host, model, prompt);
 }
 
 ChatReply proofread_email(const std::string& host, const std::string& model, const std::string& email_text,
                            const StreamCallback& on_progress) {
+    ModelSession session(host, model);
     return generate_reply(host, model, build_proofread_prompt(email_text), on_progress);
 }
 
 ChatReply chat_reply(const std::string& host, const std::string& model, const std::vector<ChatTurn>& history,
                       const std::string& message, const std::string& user_name,
                       const StreamCallback& on_progress) {
+    // A chat turn is a single reply, so the model is loaded per message rather
+    // than parked between them. Reloading costs seconds; sitting on gigabytes
+    // while the user types their next message costs more.
+    ModelSession session(host, model);
     return generate_reply(host, model, build_chat_prompt(history, message, user_name), on_progress);
 }
 

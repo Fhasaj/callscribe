@@ -39,7 +39,28 @@ struct Settings {
     std::string ollama_host = kOllamaHostDefault;
     std::string ollama_model;          // empty = not chosen yet, pick in Settings screen
     std::string ollama_keep_alive = kDefaultOllamaKeepAlive;
+    // Evict the model the moment the summary/chat reply is done, instead of
+    // letting it sit out its keep_alive. On by default: most machines running
+    // this also run Whisper, and often another Ollama client of their own, and
+    // paying a reload per operation is cheaper than a model parked in VRAM.
+    // Turn it off on a machine with memory to spare and back-to-back use.
+    bool ollama_unload_after_use = true;
     std::string whisper_model_size;    // empty = auto-suggest ("small" CPU / "medium" CUDA)
+    // Split the far end of the call into speaker turns using whisper.cpp's
+    // tinydiarize. Only the tdrz models can do this (see
+    // transcription::model_supports_speaker_turns), and it detects that the
+    // speaker *changed*, never who is speaking -- the participant list supplies
+    // the names, in the order they first speak. Off by default: turning it on
+    // means giving up the multilingual, higher-quality models for an
+    // English-only `small`.
+    bool detect_speaker_turns = false;
+    // Run offline speaker diarization over the far-end audio once a call ends,
+    // and rewrite the transcript's speaker labels with the result. Unlike the
+    // tinydiarize option above this works with any Whisper model, because it
+    // is a separate pair of ONNX models looking at the audio rather than
+    // anything Whisper does -- see transcription/diarizer.hpp. Needs its models
+    // downloaded once from Settings.
+    bool diarize_far_end = false;
     std::string mic_source;            // empty = system default source
     std::string monitor_source;        // empty = "<default-sink>.monitor"
     std::string user_display_name = kDefaultUserDisplayName;

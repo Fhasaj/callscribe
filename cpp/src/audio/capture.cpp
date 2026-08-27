@@ -93,41 +93,49 @@ void StreamCapture::reader_loop() {
         // whatever is said after the resume.
         if (paused_.load()) {
             current_level_.store(0.0f);
-            if (!pending_.empty()) {
-                chunk_queue_.push(std::move(pending_));
-                pending_.clear();
-            }
+            flush_pending();
             if (total_read < block_bytes) break;
             continue;
         }
 
         size_t n_samples = total_read / sizeof(int16_t);
         const int16_t* pcm = reinterpret_cast<const int16_t*>(buf.data());
-        std::vector<float> samples(n_samples);
-        for (size_t i = 0; i < n_samples; ++i) samples[i] = pcm[i] / 32768.0f;
 
+        // The archive copy keeps the int16 parec gave us; only the Whisper
+        // chunk needs floats, and it is appended in the same pass.
+        full_audio_.insert(full_audio_.end(), pcm, pcm + n_samples);
+        size_t pending_before = pending_.size();
+        pending_.resize(pending_before + n_samples);
         double sum_sq = 0.0;
-        for (float s : samples) sum_sq += static_cast<double>(s) * s;
-        float rms = n_samples ? static_cast<float>(std::sqrt(sum_sq / static_cast<double>(n_samples))) : 0.0f;
-        current_level_.store(rms);
-
-        full_audio_.insert(full_audio_.end(), samples.begin(), samples.end());
-        pending_.insert(pending_.end(), samples.begin(), samples.end());
-        if (pending_.size() >= chunk_target_samples) {
-            chunk_queue_.push(std::move(pending_));
-            pending_.clear();
+        for (size_t i = 0; i < n_samples; ++i) {
+            float sample = pcm[i] / 32768.0f;
+            pending_[pending_before + i] = sample;
+            sum_sq += static_cast<double>(sample) * sample;
         }
+        current_level_.store(
+            n_samples ? static_cast<float>(std::sqrt(sum_sq / static_cast<double>(n_samples))) : 0.0f);
+
+        if (pending_.size() >= chunk_target_samples) flush_pending();
 
         if (total_read < block_bytes) break;  // short read means EOF followed
     }
-    if (!pending_.empty()) {
-        chunk_queue_.push(std::move(pending_));
-        pending_.clear();
-    }
+    flush_pending();
     chunk_queue_.close();
 }
 
-std::vector<float> StreamCapture::stop() {
+void StreamCapture::flush_pending() {
+    if (pending_.empty()) return;
+    AudioChunk chunk;
+    // pending_ always holds exactly the trailing samples of full_audio_ -- both
+    // are appended together from the same block -- so the chunk's offset is
+    // where those samples begin in the recording.
+    chunk.start_sample = static_cast<int64_t>(full_audio_.size() - pending_.size());
+    chunk.samples = std::move(pending_);
+    pending_.clear();
+    chunk_queue_.push(std::move(chunk));
+}
+
+std::vector<int16_t> StreamCapture::stop() {
     if (pid_ > 0) {
         kill(pid_, SIGTERM);
         int status = 0;

@@ -96,6 +96,69 @@ TEST_CASE("tasks: extraction from a call and completion") {
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("transcript: segments carry their position in the recording and can be relabelled") {
+    auto dir = make_temp_db_dir();
+    Database db((dir / "test.db").string());
+    Repository repo(db);
+
+    int64_t call_id = repo.create_call(std::nullopt, "Standup", "");
+    repo.append_segment(call_id, "Me", "morning all", 0, 1500);
+    repo.append_segment(call_id, "Other", "morning", 1600, 2400);
+    // Written without times, as everything before diarization existed was.
+    repo.append_segment(call_id, "Other", "no timestamps here");
+
+    auto segments = repo.get_segments(call_id);
+    REQUIRE(segments.size() == 3);
+    CHECK(segments[1].start_ms == 1600);
+    CHECK(segments[1].end_ms == 2400);
+    CHECK(segments[2].start_ms == 0);
+    CHECK(segments[2].end_ms == 0);
+
+    // Diarization renaming a far-end line rewrites only that row's speaker.
+    repo.set_segment_speaker(segments[1].id, "Sarah");
+    segments = repo.get_segments(call_id);
+    CHECK(segments[0].speaker == "Me");
+    CHECK(segments[1].speaker == "Sarah");
+    CHECK(segments[1].text == "morning");
+    CHECK(segments[2].speaker == "Other");
+
+    CHECK(repo.render_transcript(call_id).find("Sarah: morning") != std::string::npos);
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("tasks: proposed tasks stay out of every list until they are confirmed") {
+    auto dir = make_temp_db_dir();
+    Database db((dir / "test.db").string());
+    Repository repo(db);
+
+    int64_t call_id = repo.create_call(std::nullopt, "Quarterly review", "");
+    int64_t proposed_id = repo.add_task("Send the revised quote", call_id, std::nullopt, "2020-01-01", "call",
+                                         kPriorityHigh, kStatusProposed);
+    repo.add_task("Something I typed myself", call_id);
+
+    // Invisible to the Tasks tab (both the "open" filter and the unfiltered
+    // listing behind "show completed"), and to the daily reminder sweep.
+    CHECK(repo.list_tasks("open").size() == 1);
+    CHECK(repo.list_tasks().size() == 1);
+    CHECK(repo.due_tasks("2099-01-01").size() == 1);
+
+    // Visible to the call it came from, which is where it gets reviewed.
+    auto for_call = repo.list_tasks_for_call(call_id);
+    CHECK(for_call.size() == 2);
+
+    repo.confirm_task(proposed_id);
+    CHECK(repo.list_tasks("open").size() == 2);
+    CHECK(repo.list_tasks(kStatusProposed).empty());
+
+    // Confirming twice must not resurrect a task that was since completed.
+    repo.complete_task(proposed_id);
+    repo.confirm_task(proposed_id);
+    CHECK(repo.list_tasks("done").size() == 1);
+
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("tasks: priority defaults to medium, and editing rewrites every field") {
     auto dir = make_temp_db_dir();
     Database db((dir / "test.db").string());

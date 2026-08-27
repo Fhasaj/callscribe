@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include <thread>
 #include <vector>
@@ -19,6 +20,20 @@ inline constexpr double kChunkSeconds = 12.0;  // audio handed to Whisper per ch
 // accumulated separately and written to the WAV in one piece.
 inline constexpr size_t kMaxQueuedChunks = 150;
 
+// One ~kChunkSeconds slice of audio handed to Whisper, tagged with where it
+// sits in the stream.
+//
+// The offset matters because speaker diarization runs on the whole recording
+// afterwards and reports speaker turns as time ranges: without knowing when
+// each transcribed chunk started, there is no way to line its text up against
+// those ranges. It counts only samples that were actually kept, so a paused
+// stretch advances neither the recording nor this clock and the two stay in
+// step.
+struct AudioChunk {
+    std::vector<float> samples;
+    int64_t start_sample = 0;
+};
+
 // Captures one named PipeWire/PulseAudio source via `parec` (spawned
 // directly with fork/exec so we retain the child pid to terminate it),
 // converts to mono float32 @ 16kHz, and exposes ~kChunkSeconds chunks via
@@ -35,7 +50,14 @@ public:
     void start();  // throws std::runtime_error if parec can't be spawned
     // Terminates parec, joins the reader thread, and returns every sample
     // captured (for archival WAV writing). Closes the chunk queue.
-    std::vector<float> stop();
+    //
+    // int16, not float: this buffer grows for the whole call and is the
+    // largest thing the app holds -- ~115 MB per recorded hour per stream,
+    // where float32 was ~230 MB. It is only ever written to a 16-bit WAV, so
+    // keeping it as the samples parec already hands us is lossless as well as
+    // half the size. (The chunks fed to Whisper are still float; those are
+    // ~12 seconds each and get released as soon as they are transcribed.)
+    std::vector<int16_t> stop();
 
     // While paused, parec keeps running and its output keeps being drained
     // (so the pipe never backs up and resuming is instant), but the samples
@@ -43,7 +65,7 @@ public:
     void set_paused(bool paused) { paused_.store(paused); }
     bool paused() const { return paused_.load(); }
 
-    util::BlockingQueue<std::vector<float>>& chunks() { return chunk_queue_; }
+    util::BlockingQueue<AudioChunk>& chunks() { return chunk_queue_; }
 
     // Chunks discarded because transcription couldn't keep up (see
     // kMaxQueuedChunks). Non-zero means the live transcript has gaps.
@@ -59,14 +81,16 @@ private:
     int read_fd_ = -1;
     std::thread reader_thread_;
 
-    std::vector<float> full_audio_;
+    std::vector<int16_t> full_audio_;
     std::vector<float> pending_;
-    mutable util::BlockingQueue<std::vector<float>> chunk_queue_;
+    mutable util::BlockingQueue<AudioChunk> chunk_queue_;
 
     std::atomic<float> current_level_{0.0f};
     std::atomic<bool> paused_{false};
 
     void reader_loop();
+    // Pushes pending_ as a chunk tagged with its start offset, and clears it.
+    void flush_pending();
 };
 
 }  // namespace callscribe::audio

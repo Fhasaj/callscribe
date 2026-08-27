@@ -39,6 +39,11 @@ struct TranscriptSegment {
     std::string speaker;
     std::string text;
     std::string created_at;
+    // Position of this line within the recording. Both 0 for lines written
+    // before timestamps were kept, and for anything that never came from the
+    // audio pipeline.
+    int64_t start_ms = 0;
+    int64_t end_ms = 0;
 };
 
 struct Note {
@@ -55,6 +60,15 @@ struct Note {
 inline constexpr const char* kPriorityLow = "low";
 inline constexpr const char* kPriorityMedium = "medium";
 inline constexpr const char* kPriorityHigh = "high";
+
+// Task lifecycle. "proposed" is what the summarizer files its extracted action
+// items as: they belong to the call and show up under its summary for review,
+// but they are deliberately NOT real tasks yet -- they stay out of the Tasks
+// tab, out of the due-date reminders, and out of every count until you confirm
+// them. Confirming flips one to "open"; deleting drops it.
+inline constexpr const char* kStatusProposed = "proposed";
+inline constexpr const char* kStatusOpen = "open";
+inline constexpr const char* kStatusDone = "done";
 
 // Maps free text ("High", "urgent", "P1", "") onto one of the three stored
 // values; anything unrecognized becomes "medium".
@@ -95,7 +109,11 @@ public:
 
     int64_t create_call(std::optional<int64_t> customer_id, const std::string& meeting_name,
                          const std::string& participants, const std::string& started_at = "");
-    void append_segment(int64_t call_id, const std::string& speaker, const std::string& text);
+    void append_segment(int64_t call_id, const std::string& speaker, const std::string& text,
+                         int64_t start_ms = 0, int64_t end_ms = 0);
+    // Renames the speaker on one transcript line. This is how diarization
+    // corrects the best-effort labels applied live once the call is over.
+    void set_segment_speaker(int64_t segment_id, const std::string& speaker);
     void finish_call(int64_t call_id, int duration_seconds, const std::string& audio_path,
                       const std::string& status = "done");
     void set_call_status(int64_t call_id, const std::string& status);
@@ -109,15 +127,24 @@ public:
                       const std::string& key_points_json);
     std::optional<Note> get_note_for_call(int64_t call_id);
 
+    // `status` is kStatusOpen for anything the user asked for directly, and
+    // kStatusProposed for model-extracted items awaiting review.
     int64_t add_task(const std::string& description, std::optional<int64_t> call_id = std::nullopt,
                       std::optional<int64_t> customer_id = std::nullopt, const std::string& due_date = "",
-                      const std::string& source = "manual", const std::string& priority = kPriorityMedium);
+                      const std::string& source = "manual", const std::string& priority = kPriorityMedium,
+                      const std::string& status = kStatusOpen);
     // Edits the user-facing fields of an existing task; status/source/call
     // linkage are left alone. An empty due_date clears the due date.
     void update_task(int64_t task_id, const std::string& description, const std::string& due_date,
                       const std::string& priority, std::optional<int64_t> customer_id);
+    // An empty `status` means "every real task" -- proposed ones are excluded
+    // unless asked for by name, so they can't leak into the Tasks tab or a count.
     std::vector<Task> list_tasks(const std::string& status = "", const std::string& customer_name = "");
+    // Returns confirmed and proposed tasks alike; callers split on Task::status.
     std::vector<Task> list_tasks_for_call(int64_t call_id);
+    // Promotes a proposed task to a real open one. No-op on a task that is
+    // already open or done.
+    void confirm_task(int64_t task_id);
     void complete_task(int64_t task_id);
     void reopen_task(int64_t task_id);
     void delete_task(int64_t task_id);

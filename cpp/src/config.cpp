@@ -55,11 +55,17 @@ Settings load_settings() {
     if (j.contains("ollama_model")) s.ollama_model = j.at("ollama_model").get<std::string>();
     // An empty value would mean "send no keep_alive at all", handing control
     // back to the server's env var -- keep the default instead.
+    if (j.contains("ollama_unload_after_use") && j.at("ollama_unload_after_use").is_boolean())
+        s.ollama_unload_after_use = j.at("ollama_unload_after_use").get<bool>();
     if (j.contains("ollama_keep_alive") && j.at("ollama_keep_alive").is_string()) {
         std::string v = j.at("ollama_keep_alive").get<std::string>();
         if (!v.empty()) s.ollama_keep_alive = v;
     }
     if (j.contains("whisper_model_size")) s.whisper_model_size = j.at("whisper_model_size").get<std::string>();
+    if (j.contains("detect_speaker_turns") && j.at("detect_speaker_turns").is_boolean())
+        s.detect_speaker_turns = j.at("detect_speaker_turns").get<bool>();
+    if (j.contains("diarize_far_end") && j.at("diarize_far_end").is_boolean())
+        s.diarize_far_end = j.at("diarize_far_end").get<bool>();
     if (j.contains("mic_source")) s.mic_source = j.at("mic_source").get<std::string>();
     if (j.contains("monitor_source")) s.monitor_source = j.at("monitor_source").get<std::string>();
     if (j.contains("user_display_name")) s.user_display_name = j.at("user_display_name").get<std::string>();
@@ -95,7 +101,10 @@ void save_settings(const Settings& s) {
     j["ollama_host"] = s.ollama_host;
     j["ollama_model"] = s.ollama_model;
     j["ollama_keep_alive"] = s.ollama_keep_alive;
+    j["ollama_unload_after_use"] = s.ollama_unload_after_use;
     j["whisper_model_size"] = s.whisper_model_size;
+    j["detect_speaker_turns"] = s.detect_speaker_turns;
+    j["diarize_far_end"] = s.diarize_far_end;
     j["mic_source"] = s.mic_source;
     j["monitor_source"] = s.monitor_source;
     j["user_display_name"] = s.user_display_name;

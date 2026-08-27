@@ -9,6 +9,7 @@
 
 #include "context.hpp"
 #include "db/repository.hpp"
+#include "ui/proposed_tasks.hpp"
 
 namespace callscribe::ui {
 
@@ -50,8 +51,15 @@ private:
     // missed without leaving the summary. linked_tasks_dirty_ is touched
     // from the regenerate() background thread too, so it's atomic.
     std::string new_task_text_;
+    // Confirmed tasks only; anything the summarizer suggested waits in
+    // proposed_tasks_ until it is reviewed.
     std::vector<db::Task> linked_tasks_;
     std::atomic<bool> linked_tasks_dirty_{true};
+
+    // Same review panel the Record tab uses, pointed at the selected call --
+    // so re-summarizing an old call here produces suggestions you can act on
+    // rather than tasks that appeared behind your back.
+    ProposedTasksPanel proposed_tasks_;
 
     ftxui::Component root_;
 

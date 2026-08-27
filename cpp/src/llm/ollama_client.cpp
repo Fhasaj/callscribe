@@ -3,7 +3,10 @@
 #include <curl/curl.h>
 
 #include <algorithm>
+#include <atomic>
+#include <map>
 #include <mutex>
+#include <utility>
 
 #include "config.hpp"
 
@@ -77,6 +80,21 @@ std::string& keep_alive_value() {
 std::string current_keep_alive() {
     std::lock_guard<std::mutex> lock(keep_alive_mutex());
     return keep_alive_value();
+}
+
+// Live ModelSessions per (host, model). Refcounted because a summarize worker
+// and a chat reply can be in flight at once; only the last one out unloads.
+std::mutex& session_mutex() {
+    static std::mutex m;
+    return m;
+}
+std::map<std::pair<std::string, std::string>, int>& session_counts() {
+    static std::map<std::pair<std::string, std::string>, int> counts;
+    return counts;
+}
+std::atomic<bool>& unload_after_use_flag() {
+    static std::atomic<bool> value{true};
+    return value;
 }
 
 std::string trim(const std::string& s) {
@@ -298,6 +316,30 @@ size_t pull_write_callback(char* ptr, size_t size, size_t nmemb, void* userdata)
 void set_keep_alive(const std::string& value) {
     std::lock_guard<std::mutex> lock(keep_alive_mutex());
     keep_alive_value() = value;
+}
+
+void set_unload_after_use(bool value) { unload_after_use_flag().store(value); }
+
+ModelSession::ModelSession(std::string host, std::string model)
+    : host_(std::move(host)), model_(std::move(model)) {
+    if (model_.empty() || !unload_after_use_flag().load()) return;
+    active_ = true;
+    std::lock_guard<std::mutex> lock(session_mutex());
+    ++session_counts()[{host_, model_}];
+}
+
+ModelSession::~ModelSession() {
+    if (!active_) return;
+    {
+        std::lock_guard<std::mutex> lock(session_mutex());
+        auto it = session_counts().find({host_, model_});
+        if (it == session_counts().end()) return;
+        if (--it->second > 0) return;  // another operation is still using it
+        session_counts().erase(it);
+    }
+    // Outside the lock: this is an HTTP round trip, and holding the mutex
+    // across it would stall any session starting on another thread.
+    unload_model(host_, model_);
 }
 
 void unload_model(const std::string& host, const std::string& model) noexcept {

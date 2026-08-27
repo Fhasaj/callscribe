@@ -51,7 +51,8 @@ int64_t Repository::create_call(std::optional<int64_t> customer_id, const std::s
     return s.last_insert_rowid();
 }
 
-void Repository::append_segment(int64_t call_id, const std::string& speaker, const std::string& text) {
+void Repository::append_segment(int64_t call_id, const std::string& speaker, const std::string& text,
+                                 int64_t start_ms, int64_t end_ms) {
     if (text.empty()) return;
     std::lock_guard<std::mutex> lock(mutex_);
     int64_t next_seq = 0;
@@ -61,10 +62,23 @@ void Repository::append_segment(int64_t call_id, const std::string& speaker, con
         if (s.step()) next_seq = s.int64(0);
     }
     Stmt ins(db_,
-             "INSERT INTO transcript_segments (call_id, seq, speaker, text, created_at) "
-             "VALUES (?, ?, ?, ?, ?)");
-    ins.bind(1, call_id).bind(2, next_seq).bind(3, speaker).bind(4, text).bind(5, util::now_iso());
+             "INSERT INTO transcript_segments (call_id, seq, speaker, text, created_at, start_ms, end_ms) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?)");
+    ins.bind(1, call_id)
+        .bind(2, next_seq)
+        .bind(3, speaker)
+        .bind(4, text)
+        .bind(5, util::now_iso())
+        .bind(6, start_ms)
+        .bind(7, end_ms);
     ins.execute();
+}
+
+void Repository::set_segment_speaker(int64_t segment_id, const std::string& speaker) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_, "UPDATE transcript_segments SET speaker = ? WHERE id = ?");
+    s.bind(1, speaker).bind(2, segment_id);
+    s.execute();
 }
 
 void Repository::finish_call(int64_t call_id, int duration_seconds, const std::string& audio_path,
@@ -151,12 +165,13 @@ std::vector<Call> Repository::list_calls(const std::string& customer_name, const
 std::vector<TranscriptSegment> Repository::get_segments(int64_t call_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     Stmt s(db_,
-           "SELECT id, call_id, seq, speaker, text, created_at FROM transcript_segments "
+           "SELECT id, call_id, seq, speaker, text, created_at, start_ms, end_ms FROM transcript_segments "
            "WHERE call_id = ? ORDER BY seq");
     s.bind(1, call_id);
     std::vector<TranscriptSegment> out;
     while (s.step()) {
-        out.push_back(TranscriptSegment{s.int64(0), s.int64(1), s.int64(2), s.text(3), s.text(4), s.text(5)});
+        out.push_back(TranscriptSegment{s.int64(0), s.int64(1), s.int64(2), s.text(3), s.text(4), s.text(5),
+                                         s.int64(6), s.int64(7)});
     }
     return out;
 }
@@ -218,18 +233,20 @@ std::string normalize_priority(const std::string& text) {
 
 int64_t Repository::add_task(const std::string& description, std::optional<int64_t> call_id,
                               std::optional<int64_t> customer_id, const std::string& due_date,
-                              const std::string& source, const std::string& priority) {
+                              const std::string& source, const std::string& priority,
+                              const std::string& status) {
     std::lock_guard<std::mutex> lock(mutex_);
     Stmt s(db_,
            "INSERT INTO tasks (call_id, customer_id, description, due_date, priority, status, source, created_at) "
-           "VALUES (?, ?, ?, ?, ?, 'open', ?, ?)");
+           "VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
     s.bind_opt(1, call_id)
         .bind_opt(2, customer_id)
         .bind(3, description)
         .bind_opt_text(4, due_date)
         .bind(5, normalize_priority(priority))
-        .bind(6, source)
-        .bind(7, util::now_iso());
+        .bind(6, status.empty() ? std::string(kStatusOpen) : status)
+        .bind(7, source)
+        .bind(8, util::now_iso());
     s.execute();
     bump();
     return s.last_insert_rowid();
@@ -276,7 +293,10 @@ constexpr const char* kPriorityRank =
 std::vector<Task> Repository::list_tasks(const std::string& status, const std::string& customer_name) {
     std::string sql = std::string("SELECT ") + kTaskColumns +
                        "FROM tasks LEFT JOIN customers ON customers.id = tasks.customer_id WHERE 1=1";
-    if (!status.empty()) sql += " AND tasks.status = ?";
+    if (!status.empty())
+        sql += " AND tasks.status = ?";
+    else
+        sql += " AND tasks.status != 'proposed'";
     if (!customer_name.empty()) sql += " AND customers.name = ?";
     sql += std::string(" ORDER BY (tasks.due_date IS NULL), tasks.due_date, ") + kPriorityRank +
             ", tasks.created_at DESC";
@@ -323,6 +343,16 @@ void Repository::delete_task(int64_t task_id) {
     Stmt s(db_, "DELETE FROM tasks WHERE id = ?");
     s.bind(1, task_id);
     s.execute();
+    bump();
+}
+
+void Repository::confirm_task(int64_t task_id) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Stmt s(db_, "UPDATE tasks SET status = 'open' WHERE id = ? AND status = 'proposed'");
+        s.bind(1, task_id);
+        s.execute();
+    }
     bump();
 }
 

@@ -55,6 +55,15 @@ int run(AppContext& ctx) {
                                             "Yearly Summary", "Chat",    "Mouse Mover", "Settings"};
     int tab_index = 0;
 
+    // "record" on a calendar meeting fills the Record form in and brings that
+    // tab forward -- the point of the button is not having to retype what the
+    // invite already says.
+    calendar_screen.set_on_record([&record, &tab_index](const std::string& meeting_name,
+                                                          const std::vector<std::string>& participants) {
+        record.prefill(meeting_name, "", participants);
+        tab_index = 0;
+    });
+
     // Reminder that's visible no matter which tab is active: recomputed once a
     // second (below) from open tasks due today or earlier, and rendered as a
     // colored badge on the Tasks entry -- the daily notify-send popup is easy

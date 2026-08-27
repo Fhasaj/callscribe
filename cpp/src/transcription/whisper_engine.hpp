@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "util/download.hpp"
+
 namespace callscribe::transcription {
 
 // The model weights, loaded once and shared by every stream.
@@ -39,6 +41,20 @@ private:
     std::string backend_note_;
 };
 
+// A run of speech that whisper attributed to one speaker. `turn_after` is set
+// on the last utterance before tinydiarize saw the speaker change -- so a chunk
+// with two people talking comes back as two Utterances, the first flagged.
+// Without tinydiarize every chunk is a single unflagged Utterance.
+struct Utterance {
+    std::string text;
+    bool turn_after = false;
+    // Milliseconds from the start of the chunk that was passed in. The caller
+    // adds the chunk's own offset to place these in the recording -- which is
+    // what lets diarization's speaker time ranges be matched to this text.
+    int64_t start_ms = 0;
+    int64_t end_ms = 0;
+};
+
 // One stream's inference state over a shared WhisperModel. Each instance is
 // owned by exactly one worker thread; two instances may run concurrently.
 class WhisperEngine {
@@ -51,23 +67,49 @@ public:
     // audio must be mono float32 @ 16kHz in [-1, 1].
     std::string transcribe(const std::vector<float>& audio);
 
+    // Same inference, but grouped into speaker turns. `detect_turns` only has
+    // an effect on a tinydiarize model (see model_supports_speaker_turns);
+    // anywhere else it costs nothing and the result is one Utterance.
+    std::vector<Utterance> transcribe_turns(const std::vector<float>& audio, bool detect_turns);
+
+    // Frees this stream's KV cache and compute buffers, keeping the shared
+    // weights loaded. The state is re-created on the next transcribe(), so
+    // this is safe to call whenever a recording ends -- which is the point:
+    // between calls the app is idle, and on `medium` those per-stream buffers
+    // are several hundred MB of GPU (or host) memory sitting unused.
+    void release_state();
+
     const std::string& backend_note() const { return model_->backend_note(); }
 
 private:
     std::shared_ptr<WhisperModel> model_;
     whisper_state* state_ = nullptr;
     std::string detected_language_;
+
+    // Allocates state_ on first use. Throws if whisper won't give us one.
+    whisper_state* ensure_state();
 };
 
 // True if whisper.cpp/ggml was compiled with a CUDA backend available.
 bool cuda_build_available();
 std::string suggest_model_size();
+
+// True for the tinydiarize models, the only ones whisper.cpp can detect
+// speaker turns with. Note what this does and does not give you: tinydiarize
+// marks that the speaker *changed*, never who is talking -- and it is trained
+// on English only, at `small` quality. Everything else silently ignores the
+// flag, which is why the Settings toggle is gated on this.
+bool model_supports_speaker_turns(const std::string& size);
 std::string model_filename(const std::string& size);      // "ggml-small.bin"
 std::string model_download_url(const std::string& size);  // HF mirror URL
 
+// True when the weights for `size` are already on disk.
+bool model_present(const std::string& size);
+
 // Downloads the GGML model file for `size` into the models dir if it's not
 // already there. Blocking -- call from a worker thread. Throws
-// std::runtime_error on failure.
-void ensure_model_downloaded(const std::string& size);
+// std::runtime_error on failure. `on_progress` is optional and is called from
+// this thread while the transfer runs.
+void ensure_model_downloaded(const std::string& size, const util::ProgressCallback& on_progress = nullptr);
 
 }  // namespace callscribe::transcription

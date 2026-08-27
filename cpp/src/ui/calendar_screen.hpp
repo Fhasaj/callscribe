@@ -4,7 +4,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <mutex>
+#include <utility>
 #include <string>
 #include <thread>
 #include <vector>
@@ -23,6 +25,15 @@ public:
     CalendarScreen& operator=(const CalendarScreen&) = delete;
 
     ftxui::Component component() { return root_; }
+
+    // Called when a meeting's "record" button is pressed, with the event's
+    // title and its attendees (the user's own name filtered out). The app wires
+    // this to the Record tab, which fills its form in and takes focus -- so a
+    // scheduled call is set up by pressing one button rather than retyping the
+    // meeting name and everyone on it.
+    using RecordRequest =
+        std::function<void(const std::string& meeting_name, const std::vector<std::string>& participants)>;
+    void set_on_record(RecordRequest handler) { on_record_ = std::move(handler); }
 
 private:
     AppContext& ctx_;
@@ -77,6 +88,17 @@ private:
     uint64_t seen_revision_ = 0;
 
     ftxui::Component list_container_;
+    // The agenda is a real container, not part of list_container_'s drawn
+    // content: every row carries a "record" button, and a scroll pane is a
+    // leaf component that can't hold focusable children.
+    ftxui::Component agenda_container_;
+    // GUI-thread copy of what the agenda rows were built from. Comparing
+    // against it is how we know the worker has delivered a different set of
+    // events and the rows have to be rebuilt -- which must not happen every
+    // frame, or the buttons would be replaced out from under the click.
+    std::vector<calendar::Event> agenda_events_;
+    RecordRequest on_record_;
+
     ftxui::Component root_;
 
     void start_worker();
@@ -93,8 +115,12 @@ private:
     // same day. Null when the meeting hasn't been recorded.
     const db::Call* recorded_call_for(const calendar::Event& event) const;
 
-    // All four take events_mutex_ already held by the caller.
-    ftxui::Element render_agenda(int width) const;
+    // Copies the current events out from under events_mutex_ and rebuilds the
+    // agenda rows if they changed. GUI thread only.
+    void sync_agenda();
+    void rebuild_agenda_rows();
+
+    // The grid renderers take events_mutex_ already held by the caller.
     ftxui::Element render_month(int width) const;
     ftxui::Element render_week(int width) const;
     ftxui::Element render_day(int width) const;

@@ -1,6 +1,5 @@
 #include "util/wav_writer.hpp"
 
-#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <stdexcept>
@@ -10,13 +9,15 @@ namespace callscribe::util {
 namespace {
 void write_u32(std::ofstream& out, uint32_t v) { out.write(reinterpret_cast<const char*>(&v), 4); }
 void write_u16(std::ofstream& out, uint16_t v) { out.write(reinterpret_cast<const char*>(&v), 2); }
-}  // namespace
 
-void write_wav_mono16(const std::string& path, const std::vector<float>& samples, int sample_rate) {
+// Opens the file and lays down the 44-byte canonical WAV header for
+// `sample_count` mono 16-bit samples, leaving the stream positioned at the
+// start of the data chunk.
+std::ofstream open_with_header(const std::string& path, size_t sample_count, int sample_rate) {
     std::ofstream out(path, std::ios::binary);
     if (!out) throw std::runtime_error("Failed to open " + path + " for writing");
 
-    uint32_t data_bytes = static_cast<uint32_t>(samples.size() * sizeof(int16_t));
+    uint32_t data_bytes = static_cast<uint32_t>(sample_count * sizeof(int16_t));
     uint32_t byte_rate = static_cast<uint32_t>(sample_rate) * 2;
 
     out.write("RIFF", 4);
@@ -34,26 +35,15 @@ void write_wav_mono16(const std::string& path, const std::vector<float>& samples
 
     out.write("data", 4);
     write_u32(out, data_bytes);
+    return out;
+}
+}  // namespace
 
-    // Convert and write in blocks. One ofstream::write per sample is ~58
-    // million calls for an hour of audio; buffering the whole file as int16
-    // first would instead add another full-length allocation, which is what
-    // this writer is called from finalize() to avoid.
-    constexpr size_t kBlockSamples = 8192;
-    std::vector<int16_t> block;
-    block.reserve(kBlockSamples);
-    auto flush_block = [&out, &block] {
-        if (block.empty()) return;
-        out.write(reinterpret_cast<const char*>(block.data()),
-                  static_cast<std::streamsize>(block.size() * sizeof(int16_t)));
-        block.clear();
-    };
-    for (float sample : samples) {
-        float clamped = std::max(-1.0f, std::min(1.0f, sample));
-        block.push_back(static_cast<int16_t>(clamped * 32767.0f));
-        if (block.size() == kBlockSamples) flush_block();
-    }
-    flush_block();
+void write_wav_mono16(const std::string& path, const std::vector<int16_t>& samples, int sample_rate) {
+    std::ofstream out = open_with_header(path, samples.size(), sample_rate);
+    out.write(reinterpret_cast<const char*>(samples.data()),
+              static_cast<std::streamsize>(samples.size() * sizeof(int16_t)));
+    if (!out) throw std::runtime_error("Failed to write " + path);
 }
 
 }  // namespace callscribe::util

@@ -274,52 +274,101 @@ const db::Call* CalendarScreen::recorded_call_for(const calendar::Event& event) 
     return calendar::recorded_call_for_event(recorded_calls_, event);
 }
 
-ftxui::Element CalendarScreen::render_agenda(int width) const {
-    using namespace ftxui;
-    if (events_.empty()) return vbox({text("Nothing scheduled in this range.") | dim});
-
-    Elements rows;
-    std::time_t current_day = 0;
-    std::time_t now = std::time(nullptr);
-    for (const calendar::Event& e : events_) {
-        std::time_t day = start_of_day(e.start);
-        if (day != current_day) {
-            if (current_day != 0) rows.push_back(text(""));
-            rows.push_back(text(day_heading(e.start)) | bold | color(theme::kAccent));
-            current_day = day;
-        }
-
-        bool in_progress = now >= e.start && now < e.end;
-        const db::Call* call = recorded_call_for(e);
-        std::string when = e.all_day ? "all day" : hhmm(e.start) + "-" + hhmm(e.end);
-        Element time_cell = text(" " + when + "  ") | size(WIDTH, EQUAL, 15);
-        std::string title = e.summary.empty() ? "(no title)" : e.summary;
-        Element title_cell = text(truncate(title, std::max(20, width - 36)));
-        if (in_progress) title_cell |= bold;
-        if (!e.busy) title_cell |= dim;  // "show as free" -- on the calendar, not really a commitment
-        // A recorded meeting is struck through and tagged, so a day's agenda
-        // shows at a glance what has actually been dealt with.
-        if (call) title_cell |= strikethrough;
-
-        Elements row_cells = {time_cell, title_cell};
-        if (call) {
-            row_cells.push_back(text("  ✓ completed") | color(theme::kSuccess) | bold);
-        }
-        Element row = hbox(std::move(row_cells));
-        if (call)
-            row |= color(theme::kMuted);
-        else if (in_progress)
-            row |= color(theme::kSuccess);
-        else if (e.end <= now)
-            row |= color(theme::kMuted);
-        rows.push_back(row);
-
-        if (!e.organizer.empty()) rows.push_back(text("   " + truncate(e.organizer, 40)) | dim);
-        if (!e.location.empty() && e.join_url.empty())
-            rows.push_back(text("   " + truncate(e.location, 60)) | dim);
-        if (!e.join_url.empty()) rows.push_back(text("   " + truncate(e.join_url, std::max(30, width - 6))) | dim);
+void CalendarScreen::sync_agenda() {
+    std::vector<calendar::Event> current;
+    {
+        std::lock_guard<std::mutex> lock(events_mutex_);
+        current = events_;
     }
-    return vbox(std::move(rows));
+    // Only the identity of the events matters here; whether one has since been
+    // recorded is read live when the row renders, so a finished call doesn't
+    // have to rebuild the list.
+    bool changed = current.size() != agenda_events_.size();
+    for (size_t i = 0; !changed && i < current.size(); ++i)
+        changed = current[i].uid != agenda_events_[i].uid || current[i].start != agenda_events_[i].start ||
+                   current[i].summary != agenda_events_[i].summary;
+    if (!changed) return;
+    agenda_events_ = std::move(current);
+    rebuild_agenda_rows();
+}
+
+void CalendarScreen::rebuild_agenda_rows() {
+    using namespace ftxui;
+
+    agenda_container_->DetachAllChildren();
+    std::time_t current_day = 0;
+    for (size_t i = 0; i < agenda_events_.size(); ++i) {
+        const calendar::Event& event = agenda_events_[i];
+        if (std::time_t day = start_of_day(event.start); day != current_day) {
+            bool first = current_day == 0;
+            current_day = day;
+            std::string heading = day_heading(event.start);
+            agenda_container_->Add(Renderer([heading, first] {
+                Elements lines;
+                if (!first) lines.push_back(text(""));
+                lines.push_back(text(heading) | bold | color(theme::kAccent));
+                return vbox(std::move(lines));
+            }));
+        }
+
+        ButtonOption record_opt;
+        record_opt.transform = [](const EntryState& s) {
+            Element e = text(s.label) | color(theme::kSuccess);
+            if (s.focused) e |= inverted;
+            return e;
+        };
+        auto record_btn = Button(
+            "[record]",
+            [this, i] {
+                if (!on_record_ || i >= agenda_events_.size()) return;
+                const calendar::Event& e = agenda_events_[i];
+                // Your own name is on the invite too; the Record screen's
+                // participant list is everyone *else*.
+                std::vector<std::string> participants;
+                for (const std::string& attendee : e.attendees)
+                    if (attendee != ctx_.settings.user_display_name) participants.push_back(attendee);
+                on_record_(e.summary, participants);
+            },
+            record_opt);
+
+        // The event is copied in, not referenced: sync_agenda() replaces
+        // agenda_events_ wholesale, and a row that outlived its element would
+        // be reading freed memory.
+        agenda_container_->Add(Renderer(record_btn, [this, event, record_btn] {
+            std::time_t now = std::time(nullptr);
+            bool in_progress = now >= event.start && now < event.end;
+            const db::Call* call = recorded_call_for(event);
+            std::string when = event.all_day ? "all day" : hhmm(event.start) + "-" + hhmm(event.end);
+            Element time_cell = text(" " + when + "  ") | size(WIDTH, EQUAL, 15);
+            std::string title = event.summary.empty() ? "(no title)" : event.summary;
+            // No manual truncation: the row is an hbox inside a framed pane, so
+            // an over-long title is clipped by the layout rather than by a
+            // width this renderer would have to be told.
+            Element title_cell = text(title);
+            if (in_progress) title_cell |= bold;
+            if (!event.busy) title_cell |= dim;  // "show as free" -- not really a commitment
+            // A recorded meeting is struck through and tagged, so a day's agenda
+            // shows at a glance what has actually been dealt with.
+            if (call) title_cell |= strikethrough;
+
+            Elements row_cells = {time_cell, title_cell};
+            if (call) row_cells.push_back(text("  ✓ completed") | color(theme::kSuccess) | bold);
+            Element row = hbox(std::move(row_cells));
+            if (call)
+                row |= color(theme::kMuted);
+            else if (in_progress)
+                row |= color(theme::kSuccess);
+            else if (event.end <= now)
+                row |= color(theme::kMuted);
+
+            Elements lines = {hbox({row, filler(), record_btn->Render(), text(" ")})};
+            if (!event.organizer.empty()) lines.push_back(text("   " + truncate(event.organizer, 40)) | dim);
+            if (!event.location.empty() && event.join_url.empty())
+                lines.push_back(text("   " + truncate(event.location, 60)) | dim);
+            if (!event.join_url.empty()) lines.push_back(text("   " + event.join_url) | dim);
+            return vbox(std::move(lines));
+        }));
+    }
 }
 
 ftxui::Element CalendarScreen::render_month(int width) const {
@@ -576,12 +625,12 @@ void CalendarScreen::build_ui() {
     };
     auto view_menu = Menu(&view_labels_, &view_selected_, view_opt);
 
+    agenda_container_ = Container::Vertical({});
     list_container_ = ScrollableContent([this](int width) -> Element {
         std::lock_guard<std::mutex> lock(events_mutex_);
         if (events_.empty() && ctx_.settings.calendar_source == "off")
             return vbox({text("No calendar imported yet -- open Setup and pick a source.") | dim});
 
-        if (view_selected_ == 1) return render_agenda(width);
         switch (range_selected_) {
             case 0: return render_day(width);
             case 2: return render_month(width);
@@ -600,10 +649,13 @@ void CalendarScreen::build_ui() {
                                   }),
                                   &setup_expanded_);
 
+    // Only the view actually on screen stays in the focus chain, so Tab does
+    // not walk through a hidden agenda's record buttons.
     auto layout = Container::Vertical({
         Container::Horizontal({view_menu, range_menu, refresh_btn, setup_btn}),
         setup_container,
-        list_container_,
+        Maybe(agenda_container_, [this] { return view_selected_ == 1; }),
+        Maybe(list_container_, [this] { return view_selected_ != 1; }),
     });
 
     root_ = Renderer(layout, [this, source_dropdown, url_input, path_input, mins_input, save_btn, refresh_btn,
@@ -672,7 +724,19 @@ void CalendarScreen::build_ui() {
             children.push_back(vbox(std::move(setup)) | borderStyled(ROUNDED, theme::kMuted));
         }
 
-        children.push_back(list_container_->Render() | flex);
+        if (view_selected_ == 1) {
+            sync_agenda();
+            bool nothing_configured = agenda_events_.empty() && ctx_.settings.calendar_source == "off";
+            if (nothing_configured)
+                children.push_back(text("No calendar imported yet -- open Setup and pick a source.") | dim);
+            else if (agenda_events_.empty())
+                children.push_back(text("Nothing scheduled in this range.") | dim);
+            else
+                children.push_back(agenda_container_->Render() | frame | flex |
+                                    borderStyled(ROUNDED, theme::kMuted));
+        } else {
+            children.push_back(list_container_->Render() | flex);
+        }
         return vbox(std::move(children)) | flex;
     });
 }

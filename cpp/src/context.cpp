@@ -8,6 +8,7 @@ AppContext::AppContext() {
     ensure_data_dirs();
     settings = load_settings();
     llm::set_keep_alive(settings.ollama_keep_alive);
+    llm::set_unload_after_use(settings.ollama_unload_after_use);
     database = std::make_unique<db::Database>(settings.db_path);
     repo = std::make_unique<db::Repository>(*database);
     reminder = std::make_unique<tasks::ReminderScheduler>(*repo, settings.reminder_time, settings.reminder_enabled);
@@ -15,6 +16,9 @@ AppContext::AppContext() {
 
 AppContext::~AppContext() {
     if (whisper_loader_thread_.joinable()) whisper_loader_thread_.join();
+    // Quitting should hand the memory back too, not leave the last model
+    // sitting out its keep_alive with nothing left to serve.
+    if (settings.ollama_unload_after_use) llm::unload_model(settings.ollama_host, settings.ollama_model);
 }
 
 void AppContext::preload_whisper() {
@@ -93,9 +97,16 @@ transcription::WhisperEngine* AppContext::monitor_engine() {
     return monitor_engine_.get();
 }
 
+void AppContext::release_whisper_states() {
+    std::lock_guard<std::mutex> lock(whisper_mutex_);
+    if (mic_engine_) mic_engine_->release_state();
+    if (monitor_engine_) monitor_engine_->release_state();
+}
+
 void AppContext::save_settings() {
     callscribe::save_settings(settings);
     llm::set_keep_alive(settings.ollama_keep_alive);
+    llm::set_unload_after_use(settings.ollama_unload_after_use);
 }
 
 }  // namespace callscribe

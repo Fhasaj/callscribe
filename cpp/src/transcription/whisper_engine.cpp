@@ -1,9 +1,9 @@
 #include "transcription/whisper_engine.hpp"
 
-#include <curl/curl.h>
 #include <ggml-backend.h>
 
 #include <algorithm>
+#include <cmath>
 #include <system_error>
 #include <cstdio>
 #include <filesystem>
@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "config.hpp"
+#include "util/download.hpp"
 
 namespace callscribe::transcription {
 
@@ -21,51 +22,60 @@ bool cuda_build_available() {
 
 std::string suggest_model_size() { return cuda_build_available() ? "medium" : "small"; }
 
+bool model_supports_speaker_turns(const std::string& size) {
+    return size.find("tdrz") != std::string::npos;
+}
+
 std::string model_filename(const std::string& size) { return "ggml-" + size + ".bin"; }
 
 std::string model_download_url(const std::string& size) {
-    return "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/" + model_filename(size);
+    // The tinydiarize models are not in whisper.cpp's own model repo -- they
+    // come from the fork that trained them, which is what upstream's
+    // models/download-ggml-model.sh does too.
+    const char* repo = model_supports_speaker_turns(size) ? "akashmjn/tinydiarize-whisper.cpp"
+                                                           : "ggerganov/whisper.cpp";
+    return std::string("https://huggingface.co/") + repo + "/resolve/main/" + model_filename(size);
 }
 
-void ensure_model_downloaded(const std::string& size) {
+bool model_present(const std::string& size) {
+    return std::filesystem::exists(models_dir() / model_filename(size));
+}
+
+void ensure_model_downloaded(const std::string& size, const util::ProgressCallback& on_progress) {
     std::filesystem::path path = models_dir() / model_filename(size);
     if (std::filesystem::exists(path)) return;
-
-    std::filesystem::create_directories(models_dir());
-    std::filesystem::path tmp_path = path;
-    tmp_path += ".part";
-
-    FILE* fp = std::fopen(tmp_path.string().c_str(), "wb");
-    if (!fp) throw std::runtime_error("Failed to open " + tmp_path.string() + " for writing");
-
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        std::fclose(fp);
-        throw std::runtime_error("curl_easy_init failed");
-    }
-
-    std::string url = model_download_url(size);
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
-    CURLcode res = curl_easy_perform(curl);
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    curl_easy_cleanup(curl);
-    std::fclose(fp);
-
-    if (res != CURLE_OK || http_code >= 400) {
-        std::filesystem::remove(tmp_path);
-        std::string reason = res != CURLE_OK ? curl_easy_strerror(res) : ("HTTP " + std::to_string(http_code));
-        throw std::runtime_error("Failed to download " + url + ": " + reason);
-    }
-    std::filesystem::rename(tmp_path, path);
+    util::download_to_file(model_download_url(size), path, on_progress);
 }
 
 namespace {
 
 std::string format_mib(size_t bytes) { return std::to_string(bytes / (1024 * 1024)) + " MiB"; }
+
+// Loudest sample a chunk must reach before it is worth transcribing at all.
+//
+// Whisper invents speech when handed silence -- "Thank you.", "Thanks for
+// watching!" and friends are in its training data at the points where nothing
+// is being said, and it will emit them confidently for a chunk of pure room
+// tone. `small.en` is among the worst for it, so turning on tinydiarize makes
+// the problem very visible.
+//
+// Peak, deliberately, not RMS: a 12-second chunk holding one short sentence
+// averages out to near-silence, so an RMS gate would throw away exactly the
+// quiet-but-real speech we care about. Peak only asks "did anything in here
+// ever get near speaking volume", and genuine speech clears 0.02 (-34 dBFS)
+// with room to spare even from a distant or quiet talker.
+constexpr float kSilencePeak = 0.02f;
+
+bool is_silence(const std::vector<float>& audio) {
+    for (float sample : audio)
+        if (std::fabs(sample) >= kSilencePeak) return false;
+    return true;
+}
+
+// Whisper's own estimate that a segment is not speech. It already uses this
+// internally for timestamp decisions but still hands the segment over, so the
+// filtering has to happen here. 0.6 is whisper's own default threshold.
+constexpr float kNoSpeechThreshold = 0.6f;
 
 struct GpuChoice {
     bool any_gpu = false;   // a GPU backend exists at all
@@ -145,16 +155,44 @@ WhisperModel::~WhisperModel() {
 
 WhisperEngine::WhisperEngine(std::shared_ptr<WhisperModel> model) : model_(std::move(model)) {
     if (!model_ || !model_->raw()) throw std::runtime_error("Whisper model not loaded");
-    state_ = whisper_init_state(model_->raw());
-    if (!state_) throw std::runtime_error("Failed to allocate a Whisper inference state");
+    // The state is NOT allocated here. It is the expensive part per stream --
+    // KV cache plus compute buffers -- and the app spends most of its life not
+    // recording, so it is created on the first chunk and released again by
+    // release_state() when the call ends.
 }
 
-WhisperEngine::~WhisperEngine() {
-    if (state_) whisper_free_state(state_);
+WhisperEngine::~WhisperEngine() { release_state(); }
+
+whisper_state* WhisperEngine::ensure_state() {
+    if (!state_) {
+        state_ = whisper_init_state(model_->raw());
+        if (!state_) throw std::runtime_error("Failed to allocate a Whisper inference state");
+    }
+    return state_;
+}
+
+void WhisperEngine::release_state() {
+    if (!state_) return;
+    whisper_free_state(state_);
+    state_ = nullptr;
 }
 
 std::string WhisperEngine::transcribe(const std::vector<float>& audio) {
-    if (audio.empty() || !state_) return "";
+    std::string text;
+    for (const Utterance& u : transcribe_turns(audio, /*detect_turns=*/false)) {
+        if (u.text.empty()) continue;
+        if (!text.empty()) text += " ";
+        text += u.text;
+    }
+    return text;
+}
+
+std::vector<Utterance> WhisperEngine::transcribe_turns(const std::vector<float>& audio, bool detect_turns) {
+    // Cheapest and most effective of the three anti-hallucination measures
+    // here, and it saves the inference entirely -- most chunks of a call are
+    // silence on one side or the other.
+    if (audio.empty() || is_silence(audio)) return {};
+    whisper_state* state = ensure_state();
 
     whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     params.print_progress = false;
@@ -163,33 +201,74 @@ std::string WhisperEngine::transcribe(const std::vector<float>& audio) {
     params.print_timestamps = false;
     params.translate = false;
     params.single_segment = false;
-    params.n_threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    // Chunks are handed over already split on ~12s boundaries and each one is
+    // transcribed independently, so carrying the previous chunk's text in as a
+    // prompt buys little -- and it grows the decoder's context (and the
+    // memory behind it) chunk after chunk over a long call.
+    params.no_context = true;
+    // Two engines transcribe concurrently (mic and far end), so a full
+    // hardware_concurrency each oversubscribes the machine twofold and doubles
+    // the per-thread working buffers. Half each, at least one.
+    params.n_threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency() / 2));
     params.language = detected_language_.empty() ? nullptr : detected_language_.c_str();
+    params.tdrz_enable = detect_turns;
+    // Non-speech tokens (music cues, "[BLANK_AUDIO]", punctuation-only output)
+    // are suppressed rather than transcribed, and the temperature fallback is
+    // off: on a near-silent chunk the retry loop is what escalates a shaky
+    // decode into a confident invented sentence. Same choice whisper.cpp's own
+    // streaming example makes.
+    params.suppress_nst = true;
+    params.no_speech_thold = kNoSpeechThreshold;
+    params.temperature_inc = 0.0f;
 
-    if (whisper_full_with_state(model_->raw(), state_, params, audio.data(), static_cast<int>(audio.size())) != 0) {
+    if (whisper_full_with_state(model_->raw(), state, params, audio.data(), static_cast<int>(audio.size())) != 0) {
         throw std::runtime_error("whisper_full failed");
     }
 
     if (detected_language_.empty()) {
-        int lang_id = whisper_full_lang_id_from_state(state_);
+        int lang_id = whisper_full_lang_id_from_state(state);
         if (lang_id >= 0) {
             const char* lang = whisper_lang_str(lang_id);
             if (lang) detected_language_ = lang;
         }
     }
 
-    std::string text;
-    int n_segments = whisper_full_n_segments_from_state(state_);
+    // Segments are glued together until whisper flags a speaker change, so an
+    // utterance is a whole turn rather than one 5-second fragment of one.
+    std::vector<Utterance> out;
+    Utterance current;
+    bool current_started = false;
+    int n_segments = whisper_full_n_segments_from_state(state);
     for (int i = 0; i < n_segments; ++i) {
-        const char* seg = whisper_full_get_segment_text_from_state(state_, i);
+        // Last line of defence: whisper scored this segment as probably not
+        // speech, but produced text for it anyway.
+        if (whisper_full_get_segment_no_speech_prob_from_state(state, i) > kNoSpeechThreshold) continue;
+        const char* seg = whisper_full_get_segment_text_from_state(state, i);
         if (!seg) continue;
         std::string s(seg);
         size_t start = s.find_first_not_of(' ');
-        if (start == std::string::npos) continue;
-        if (!text.empty()) text += " ";
-        text += s.substr(start);
+        if (start != std::string::npos) {
+            if (!current.text.empty()) current.text += " ";
+            current.text += s.substr(start);
+            // whisper reports segment times in centiseconds. An utterance spans
+            // from the first segment folded into it to the last.
+            if (!current_started) {
+                current.start_ms = whisper_full_get_segment_t0_from_state(state, i) * 10;
+                current_started = true;
+            }
+            current.end_ms = whisper_full_get_segment_t1_from_state(state, i) * 10;
+        }
+        if (detect_turns && whisper_full_get_segment_speaker_turn_next_from_state(state, i)) {
+            if (!current.text.empty()) {
+                current.turn_after = true;
+                out.push_back(std::move(current));
+            }
+            current = Utterance{};
+            current_started = false;
+        }
     }
-    return text;
+    if (!current.text.empty()) out.push_back(std::move(current));
+    return out;
 }
 
 }  // namespace callscribe::transcription

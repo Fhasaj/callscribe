@@ -38,6 +38,11 @@ public:
     std::string whisper_notice() const;
     transcription::WhisperEngine* mic_engine();
     transcription::WhisperEngine* monitor_engine();
+    // Hands back the per-stream inference buffers (KV cache, scratch) while
+    // keeping the weights loaded, so an idle app isn't sitting on memory it
+    // won't use until the next recording. Call once a call has finished
+    // transcribing; the next transcribe() re-allocates transparently.
+    void release_whisper_states();
 
     void save_settings();
 
