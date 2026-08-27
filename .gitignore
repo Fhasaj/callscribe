@@ -11,3 +11,6 @@ cpp/compile_commands.json
 
 # IDE
 .idea/
+
+# Language-server / tooling caches (clangd, neocmakelsp)
+.cache/
