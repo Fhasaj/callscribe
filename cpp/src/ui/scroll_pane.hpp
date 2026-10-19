@@ -21,7 +21,10 @@ namespace callscribe::ui {
 //
 // `provider` is called on every render, so screens keep owning their text (and
 // their mutex) -- take the lock inside the callback.
-ftxui::Component ScrollableText(std::function<std::string()> provider, std::string placeholder = "");
+// `title`, if given, is set into the top border the way ui::section() titles
+// its panels, so a pane can stand in for a section of its own.
+ftxui::Component ScrollableText(std::function<std::string()> provider, std::string placeholder = "",
+                                std::string title = "");
 
 // Same behaviour for content that isn't a single string (e.g. a stack of
 // message bubbles). Line-accurate stepping isn't possible here, so it scrolls
@@ -33,5 +36,13 @@ ftxui::Component ScrollableText(std::function<std::string()> provider, std::stri
 // manual scrolling untouched the rest of the time.
 ftxui::Component ScrollableContent(std::function<ftxui::Element(int width)> provider,
                                     std::function<int()> follow_key = nullptr);
+
+// Makes a whole interactive screen (a form of inputs and buttons) scroll when
+// it is taller than the space it gets. The mouse wheel scrolls it anywhere
+// over the screen and the view then stays put, so a click lands on what you
+// scrolled to; moving through the fields from the keyboard (Tab, arrows,
+// typing) switches back to keeping the focused field in view. Clicks and keys
+// go to `form` as usual -- this only decides which slice of it is visible.
+ftxui::Component ScrollableForm(ftxui::Component form);
 
 }  // namespace callscribe::ui

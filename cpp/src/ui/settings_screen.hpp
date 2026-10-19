@@ -33,6 +33,13 @@ public:
 private:
     AppContext& ctx_;
 
+    // Which AI server: 0 = Ollama, 1 = llama.cpp (llama-server).
+    std::vector<std::string> llm_backends_ = {"Ollama", "llama.cpp"};
+    int llm_backend_index_ = 0;
+    std::string llamacpp_host_;
+    std::string llamacpp_status_;
+    std::string llamacpp_api_key_;
+
     std::vector<std::string> ollama_models_;
     int ollama_model_selected_ = 0;
     std::atomic<bool> models_need_refresh_{false};
@@ -60,6 +67,21 @@ private:
     bool reminder_enabled_ = true;
     bool echo_cancel_ = true;
 
+    // Focus timer lengths, as typed; parsed and clamped on Save.
+    std::string focus_minutes_;
+    std::string short_break_minutes_;
+    std::string long_break_minutes_;
+
+    std::string hyperfocus_minutes_;
+    std::string meeting_reminder_minutes_;
+    std::string end_of_day_time_;
+    bool end_of_day_enabled_ = true;
+
+    std::string spotify_client_id_;
+    std::string spotify_port_;
+    std::string spotify_playlist_;
+    std::string spotify_note_;  // validation feedback from Save/Connect
+
     // Editable AI prompt presets (what to ask for; the JSON envelope is fixed).
     std::string summary_prompt_;
     std::string email_prompt_;
@@ -67,6 +89,7 @@ private:
 
     std::mutex status_mutex_;
     std::string ollama_status_;
+    std::string save_status_;  // footer line after Save
     std::string pull_status_;
     std::string whisper_status_;
     bool pulling_ = false;
@@ -101,6 +124,9 @@ private:
     ftxui::Component root_;
 
     void refresh_models();
+    // Saves the llama.cpp choice and asks the server what it has loaded and
+    // how big its context window is.
+    void check_llamacpp();
     void refresh_audio_devices();
     void pull_recommended();
     void unload_now();
@@ -110,6 +136,10 @@ private:
     void start_monitor_test();
     void stop_test();
     void save();
+    // Copies the focus-timer and Spotify fields into ctx_.settings, without
+    // writing the file -- shared by Save and by Connect, which mustn't pay for
+    // the Whisper reload a full Save triggers.
+    void apply_focus_and_spotify_fields();
     void build_ui();
 };
 

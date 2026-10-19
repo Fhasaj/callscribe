@@ -59,12 +59,52 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed_at TEXT
 );
 
+-- One Pomodoro focus round: what it was for, what you meant to do, and
+-- where you actually got to. Not tied to a call, so not in `notes`.
+CREATE TABLE IF NOT EXISTS focus_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL,
+    next_step TEXT,
+    progress_note TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    duration_seconds INTEGER NOT NULL
+);
+
+-- One-line "that went well" notes, captured the moment they happen so the
+-- year-end review has more to go on than memory.
+CREATE TABLE IF NOT EXISTS wins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,
+    tag TEXT,
+    created_at TEXT NOT NULL
+);
+
+-- Stray thoughts parked mid-focus, to be dealt with at the next break.
+-- resolved_at stays NULL until it's turned into a task or let go.
+CREATE TABLE IF NOT EXISTS parked_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+
+-- End-of-day wrap-up: the generated digest of the day plus your own line.
+CREATE TABLE IF NOT EXISTS daily_logs (
+    day TEXT PRIMARY KEY,
+    digest TEXT NOT NULL,
+    note TEXT,
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_calls_customer ON calls(customer_id);
 CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_at);
 CREATE INDEX IF NOT EXISTS idx_segments_call ON transcript_segments(call_id, seq);
 CREATE INDEX IF NOT EXISTS idx_notes_call ON notes(call_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_customer ON tasks(customer_id);
+CREATE INDEX IF NOT EXISTS idx_focus_started ON focus_sessions(started_at);
+CREATE INDEX IF NOT EXISTS idx_wins_created ON wins(created_at);
 )sql";
 }  // namespace
 

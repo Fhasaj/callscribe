@@ -286,3 +286,15 @@ TEST_CASE("empty and non-calendar input yield no events") {
     CHECK(parse_ics("", utc(2026, 8, 1), utc(2026, 8, 10)).empty());
     CHECK(parse_ics("<html>sign in</html>", utc(2026, 8, 1), utc(2026, 8, 10)).empty());
 }
+
+TEST_CASE("Outlook's out-of-office status is read from the feed") {
+    std::string ics = wrap(
+        "BEGIN:VEVENT\r\nUID:oof\r\nSUMMARY:Busy\r\nX-MICROSOFT-CDO-BUSYSTATUS:OOF\r\n"
+        "DTSTART:20260804T090000Z\r\nDTEND:20260804T170000Z\r\nEND:VEVENT\r\n"
+        "BEGIN:VEVENT\r\nUID:meet\r\nSUMMARY:Sync\r\nX-MICROSOFT-CDO-BUSYSTATUS:BUSY\r\n"
+        "DTSTART:20260805T090000Z\r\nDTEND:20260805T100000Z\r\nEND:VEVENT\r\n");
+    auto events = parse_ics(ics, utc(2026, 8, 1), utc(2026, 8, 10));
+    REQUIRE(events.size() == 2);
+    CHECK(events[0].out_of_office);
+    CHECK_FALSE(events[1].out_of_office);
+}

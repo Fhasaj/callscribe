@@ -1,5 +1,6 @@
 #include "db/repository.hpp"
 
+#include <algorithm>
 #include <cctype>
 
 #include "util/time.hpp"
@@ -422,6 +423,185 @@ YearlyStats Repository::yearly_stats(int year) {
         }
     }
     return stats;
+}
+
+// -- focus sessions -----------------------------------------------------------
+
+int64_t Repository::add_focus_session(const FocusSession& session) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_,
+           "INSERT INTO focus_sessions (tag, next_step, progress_note, started_at, ended_at, duration_seconds) "
+           "VALUES (?, ?, ?, ?, ?, ?)");
+    s.bind(1, session.tag)
+        .bind_opt_text(2, session.next_step)
+        .bind_opt_text(3, session.progress_note)
+        .bind(4, session.started_at)
+        .bind(5, session.ended_at)
+        .bind(6, session.duration_seconds);
+    s.execute();
+    return s.last_insert_rowid();
+}
+
+std::vector<FocusSession> Repository::list_focus_sessions(int limit) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_,
+           "SELECT id, tag, next_step, progress_note, started_at, ended_at, duration_seconds "
+           "FROM focus_sessions ORDER BY started_at DESC, id DESC LIMIT ?");
+    s.bind(1, limit);
+    std::vector<FocusSession> out;
+    while (s.step()) {
+        out.push_back(FocusSession{s.int64(0), s.text(1), s.text(2), s.text(3), s.text(4), s.text(5), s.int_(6)});
+    }
+    return out;
+}
+
+std::vector<FocusSession> Repository::list_focus_sessions_between(const std::string& from, const std::string& to) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_,
+           "SELECT id, tag, next_step, progress_note, started_at, ended_at, duration_seconds "
+           "FROM focus_sessions WHERE started_at >= ? AND started_at < ? ORDER BY started_at");
+    s.bind(1, from).bind(2, to);
+    std::vector<FocusSession> out;
+    while (s.step()) {
+        out.push_back(FocusSession{s.int64(0), s.text(1), s.text(2), s.text(3), s.text(4), s.text(5), s.int_(6)});
+    }
+    return out;
+}
+
+std::vector<std::pair<std::string, int>> Repository::focus_seconds_by_tag(const std::string& from,
+                                                                         const std::string& to) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_,
+           "SELECT tag, SUM(duration_seconds) AS total FROM focus_sessions "
+           "WHERE started_at >= ? AND started_at < ? GROUP BY tag ORDER BY total DESC");
+    s.bind(1, from).bind(2, to);
+    std::vector<std::pair<std::string, int>> out;
+    while (s.step()) out.emplace_back(s.text(0), s.int_(1));
+    return out;
+}
+
+// -- wins ---------------------------------------------------------------------
+
+int64_t Repository::add_win(const std::string& text, const std::string& tag) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_, "INSERT INTO wins (text, tag, created_at) VALUES (?, ?, ?)");
+    s.bind(1, text).bind_opt_text(2, tag).bind(3, util::now_iso());
+    s.execute();
+    bump();
+    return s.last_insert_rowid();
+}
+
+void Repository::delete_win(int64_t id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_, "DELETE FROM wins WHERE id = ?");
+    s.bind(1, id);
+    s.execute();
+    bump();
+}
+
+std::vector<Win> Repository::list_wins(const std::string& from, const std::string& to) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_,
+           "SELECT id, text, tag, created_at FROM wins WHERE created_at >= ? AND created_at < ? "
+           "ORDER BY created_at DESC, id DESC");
+    s.bind(1, from).bind(2, to);
+    std::vector<Win> out;
+    while (s.step()) out.push_back(Win{s.int64(0), s.text(1), s.text(2), s.text(3)});
+    return out;
+}
+
+// -- parking lot --------------------------------------------------------------
+
+int64_t Repository::park(const std::string& text) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_, "INSERT INTO parked_items (text, created_at) VALUES (?, ?)");
+    s.bind(1, text).bind(2, util::now_iso());
+    s.execute();
+    bump();
+    return s.last_insert_rowid();
+}
+
+std::vector<ParkedItem> Repository::list_parked() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_, "SELECT id, text, created_at FROM parked_items WHERE resolved_at IS NULL ORDER BY created_at, id");
+    std::vector<ParkedItem> out;
+    while (s.step()) out.push_back(ParkedItem{s.int64(0), s.text(1), s.text(2)});
+    return out;
+}
+
+void Repository::resolve_parked(int64_t id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_, "UPDATE parked_items SET resolved_at = ? WHERE id = ?");
+    s.bind(1, util::now_iso()).bind(2, id);
+    s.execute();
+    bump();
+}
+
+// -- daily logs ---------------------------------------------------------------
+
+void Repository::save_daily_log(const std::string& day, const std::string& digest, const std::string& note) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_,
+           "INSERT INTO daily_logs (day, digest, note, updated_at) VALUES (?, ?, ?, ?) "
+           "ON CONFLICT(day) DO UPDATE SET digest = excluded.digest, note = excluded.note, "
+           "updated_at = excluded.updated_at");
+    s.bind(1, day).bind(2, digest).bind_opt_text(3, note).bind(4, util::now_iso());
+    s.execute();
+    bump();
+}
+
+std::optional<DailyLog> Repository::get_daily_log(const std::string& day) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_, "SELECT day, digest, note, updated_at FROM daily_logs WHERE day = ?");
+    s.bind(1, day);
+    if (!s.step()) return std::nullopt;
+    return DailyLog{s.text(0), s.text(1), s.text(2), s.text(3)};
+}
+
+std::vector<DailyLog> Repository::list_daily_logs(const std::string& from, const std::string& to) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_, "SELECT day, digest, note, updated_at FROM daily_logs WHERE day >= ? AND day < ? ORDER BY day");
+    s.bind(1, from.substr(0, 10)).bind(2, to.substr(0, 10));
+    std::vector<DailyLog> out;
+    while (s.step()) out.push_back(DailyLog{s.text(0), s.text(1), s.text(2), s.text(3)});
+    return out;
+}
+
+// -- review evidence ----------------------------------------------------------
+
+std::vector<CallNote> Repository::list_call_notes(const std::string& from, const std::string& to) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_,
+           "SELECT calls.started_at, COALESCE(customers.name, ''), COALESCE(calls.meeting_name, ''), notes.summary "
+           "FROM notes JOIN calls ON calls.id = notes.call_id "
+           "LEFT JOIN customers ON customers.id = calls.customer_id "
+           "WHERE calls.started_at >= ? AND calls.started_at < ? AND notes.summary IS NOT NULL "
+           "AND notes.summary != '' ORDER BY calls.started_at");
+    s.bind(1, from).bind(2, to);
+    std::vector<CallNote> out;
+    while (s.step()) out.push_back(CallNote{s.text(0), s.text(1), s.text(2), s.text(3)});
+    return out;
+}
+
+std::vector<Task> Repository::list_completed_tasks(const std::string& from, const std::string& to) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stmt s(db_, std::string("SELECT ") + kTaskColumns +
+                    "FROM tasks LEFT JOIN customers ON customers.id = tasks.customer_id "
+                    "WHERE tasks.status = 'done' AND tasks.completed_at >= ? AND tasks.completed_at < ? "
+                    "ORDER BY tasks.completed_at");
+    s.bind(1, from).bind(2, to);
+    std::vector<Task> out;
+    while (s.step()) out.push_back(read_task_row(s));
+    return out;
+}
+
+std::vector<Call> Repository::list_calls_between(const std::string& from, const std::string& to) {
+    std::vector<Call> out;
+    for (auto& c : list_calls()) {
+        if (c.started_at >= from && c.started_at < to) out.push_back(std::move(c));
+    }
+    std::reverse(out.begin(), out.end());
+    return out;
 }
 
 }  // namespace callscribe::db

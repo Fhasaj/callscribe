@@ -1,24 +1,37 @@
 #include "context.hpp"
 
 #include "llm/ollama_client.hpp"
+#include "util/keyring.hpp"
 
 namespace callscribe {
 
 AppContext::AppContext() {
     ensure_data_dirs();
     settings = load_settings();
+    llm::set_backend(settings.uses_llamacpp() ? llm::Backend::LlamaCpp : llm::Backend::Ollama);
     llm::set_keep_alive(settings.ollama_keep_alive);
     llm::set_unload_after_use(settings.ollama_unload_after_use);
+    // Only when it'll be used: a keyring lookup can mean a wallet-unlock prompt.
+    if (settings.uses_llamacpp()) load_llamacpp_api_key();
     database = std::make_unique<db::Database>(settings.db_path);
     repo = std::make_unique<db::Repository>(*database);
     reminder = std::make_unique<tasks::ReminderScheduler>(*repo, settings.reminder_time, settings.reminder_enabled);
+    reminder->set_end_of_day(settings.end_of_day_time, settings.end_of_day_enabled);
+    meeting_reminder = std::make_unique<tasks::MeetingReminder>();
+    meeting_reminder->set_lead_minutes(settings.meeting_reminder_minutes);
+    meeting_reminder->start();
+    spotify = std::make_unique<spotify::SpotifyClient>();
+    spotify->configure(settings.spotify_client_id, settings.spotify_redirect_port);
+    // Off the UI thread like everything else it does: unlocking the keyring
+    // may be waiting on a KWallet / GNOME Keyring prompt.
+    spotify->check();
 }
 
 AppContext::~AppContext() {
     if (whisper_loader_thread_.joinable()) whisper_loader_thread_.join();
     // Quitting should hand the memory back too, not leave the last model
     // sitting out its keep_alive with nothing left to serve.
-    if (settings.ollama_unload_after_use) llm::unload_model(settings.ollama_host, settings.ollama_model);
+    if (settings.ollama_unload_after_use) llm::unload_model(settings.llm_host(), settings.llm_model());
 }
 
 void AppContext::preload_whisper() {
@@ -105,8 +118,37 @@ void AppContext::release_whisper_states() {
 
 void AppContext::save_settings() {
     callscribe::save_settings(settings);
+    llm::set_backend(settings.uses_llamacpp() ? llm::Backend::LlamaCpp : llm::Backend::Ollama);
     llm::set_keep_alive(settings.ollama_keep_alive);
     llm::set_unload_after_use(settings.ollama_unload_after_use);
+    spotify->configure(settings.spotify_client_id, settings.spotify_redirect_port);
+}
+
+void AppContext::load_llamacpp_api_key() {
+    std::lock_guard<std::mutex> lock(api_key_mutex_);
+    if (api_key_loaded_) return;
+    api_key_loaded_ = true;
+    std::string error;
+    llamacpp_api_key_ = util::lookup_secret(kLlamaCppApiKeySecret, error).value_or("");
+    llm::set_api_key(llamacpp_api_key_);
+}
+
+std::string AppContext::llamacpp_api_key() const {
+    std::lock_guard<std::mutex> lock(api_key_mutex_);
+    return llamacpp_api_key_;
+}
+
+std::string AppContext::set_llamacpp_api_key(const std::string& key) {
+    std::lock_guard<std::mutex> lock(api_key_mutex_);
+    if (api_key_loaded_ && key == llamacpp_api_key_) return "";
+    std::string error;
+    bool ok = key.empty() ? util::clear_secret(kLlamaCppApiKeySecret, error)
+                          : util::store_secret(kLlamaCppApiKeySecret, key, error);
+    // Used for this run even if the keyring refused it.
+    api_key_loaded_ = true;
+    llamacpp_api_key_ = key;
+    llm::set_api_key(key);
+    return ok ? "" : error;
 }
 
 }  // namespace callscribe

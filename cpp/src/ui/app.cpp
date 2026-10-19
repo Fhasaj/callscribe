@@ -11,15 +11,19 @@
 
 #include "ui/calendar_screen.hpp"
 #include "ui/chat_screen.hpp"
+#include "ui/focus_screen.hpp"
 #include "ui/history_screen.hpp"
 #include "ui/logo.hpp"
 #include "ui/mouse_mover_screen.hpp"
+#include "ui/quick_capture.hpp"
 #include "ui/record_screen.hpp"
 #include "ui/settings_screen.hpp"
 #include "ui/summary_screen.hpp"
 #include "ui/tasks_screen.hpp"
 #include "ui/text_wrap.hpp"
+#include "ui/today_screen.hpp"
 #include "ui/theme.hpp"
+#include "ui/widgets.hpp"
 #include "util/clipboard.hpp"
 #include "util/time.hpp"
 
@@ -28,6 +32,7 @@ namespace callscribe::ui {
 namespace {
 constexpr int kTasksTabIndex = 2;
 constexpr int kMouseMoverTabIndex = 6;
+constexpr int kFocusTabIndex = 7;
 
 // Not a real terminal event -- posted to make FTXUI drop the current
 // selection. Any event the component tree reports as handled clears it (see
@@ -49,10 +54,13 @@ int run(AppContext& ctx) {
     SummaryScreen summary(ctx);
     ChatScreen chat(ctx);
     MouseMoverScreen mouse_mover(ctx);
+    // A call being recorded counts as "still going" for the hyperfocus check-in.
+    FocusScreen focus_screen(ctx, screen, [&record] { return record.is_recording(); });
+    TodayScreen today(ctx);
     SettingsScreen settings(ctx);
 
-    std::vector<std::string> tab_titles = {"Record",         "History", "Tasks",       "Calendar",
-                                            "Yearly Summary", "Chat",    "Mouse Mover", "Settings"};
+    std::vector<std::string> tab_titles = {"Record", "History",     "Tasks", "Calendar", "Review",
+                                            "Chat",   "Mouse Mover", "Focus", "Today",    "Settings"};
     int tab_index = 0;
 
     // "record" on a calendar meeting fills the Record form in and brings that
@@ -71,19 +79,25 @@ int run(AppContext& ctx) {
     std::atomic<int> tasks_alert_count{0};
 
     MenuOption tab_opt = MenuOption::HorizontalAnimated();
-    tab_opt.entries_option.transform = [&tasks_alert_count, &mouse_mover](const EntryState& state) {
-        std::string label = (state.active ? "> " : "  ") + state.label;
+    tab_opt.entries_option.transform = [&tasks_alert_count, &mouse_mover, &focus_screen](const EntryState& state) {
+        std::string label = " " + state.label;
         int alerts = (state.index == kTasksTabIndex) ? tasks_alert_count.load() : 0;
         if (alerts > 0) label += " (" + std::to_string(alerts) + ")";
         // The mouse mover runs in the background across every tab, so its
         // on/off state has to be visible from every tab too.
         bool jiggling = state.index == kMouseMoverTabIndex && mouse_mover.is_running();
         if (jiggling) label += " *";
+        // Same idea for a running focus timer: the countdown follows you.
+        FocusScreen::Badge focus_badge =
+            state.index == kFocusTabIndex ? focus_screen.tab_badge() : FocusScreen::Badge{"", theme::kMuted};
+        label += focus_badge.text;
 
+        label += " ";
         Element e = text(label);
         if (state.active) e |= bold | color(theme::kAccent);
         if (alerts > 0 && !state.active) e |= color(theme::kDanger);
         if (jiggling && !state.active) e |= color(theme::kSuccess);
+        if (!focus_badge.text.empty() && !state.active) e |= color(focus_badge.color);
         if (state.focused) e |= inverted;
         return e;
     };
@@ -98,6 +112,8 @@ int run(AppContext& ctx) {
             summary.component(),
             chat.component(),
             mouse_mover.component(),
+            focus_screen.component(),
+            today.component(),
             settings.component(),
         },
         &tab_index);
@@ -132,9 +148,9 @@ int run(AppContext& ctx) {
             close_confirm_visible = false;
             screen.Exit();
         },
-        ButtonOption::Animated(theme::kDanger));
+        button_style(theme::kDanger));
     auto cancel_quit_btn = Button(
-        "Keep recording", [&] { close_confirm_visible = false; }, ButtonOption::Animated(theme::kAccent));
+        "Keep recording", [&] { close_confirm_visible = false; }, button_style(theme::kAccent));
     auto confirm_quit_buttons = Container::Horizontal({confirm_quit_btn, cancel_quit_btn});
     auto quit_confirm_modal = Renderer(confirm_quit_buttons, [confirm_quit_btn, cancel_quit_btn] {
         return vbox({
@@ -229,6 +245,11 @@ int run(AppContext& ctx) {
         set_note("Selected everything -- ^G to copy");
     };
 
+    // ^W / ^P from any tab: catch a win or a stray thought without losing
+    // your place.
+    QuickCapture capture(
+        ctx, [&focus_screen] { return focus_screen.current_tag(); }, [&](const std::string& m) { set_note(m); });
+
     auto do_deselect_all = [&] {
         screen.PostEvent(kDeselectEvent);
         context_selection.clear();
@@ -303,7 +324,11 @@ int run(AppContext& ctx) {
                    flex | borderStyled(ROUNDED, theme::kMuted);
         }
 
-        Element status = text("  ^G copy  ^V paste  (or right-click)  ") | color(theme::kMuted);
+        Element status = text("  ^G copy  ^V paste  ^W win  ^P park  ") | color(theme::kMuted);
+        // What you're meant to be doing, from every tab -- the one line that
+        // gets you back on track after wandering into History.
+        if (FocusScreen::Badge note = focus_screen.title_note(); !note.text.empty())
+            status = text("  " + note.text + "  ") | color(note.color) | bold;
         if (!context_note.empty()) {
             if (std::chrono::steady_clock::now() - context_note_at > std::chrono::seconds(3))
                 context_note.clear();
@@ -333,8 +358,8 @@ int run(AppContext& ctx) {
         Element document = vbox({
                                titlebar,
                                separator() | color(theme::kMuted),
+                               // The animated menu draws its own rule underneath.
                                tab_menu->Render(),
-                               separator() | color(theme::kMuted),
                                tab_container->Render() | flex,
                            }) |
                            flex | borderStyled(ROUNDED, theme::kMuted);
@@ -361,6 +386,7 @@ int run(AppContext& ctx) {
         return document;
     });
     main_renderer |= Modal(quit_confirm_modal, &close_confirm_visible);
+    main_renderer |= Modal(capture.component(), capture.visible());
 
     main_renderer |= CatchEvent([&](Event event) {
         // Any real input dismisses the splash and is swallowed, so the keypress
@@ -390,6 +416,14 @@ int run(AppContext& ctx) {
             do_paste();
             return true;
         }
+        const bool overlay_open = context_visible || close_confirm_visible || *capture.visible();
+        if (!overlay_open && (event == Event::CtrlW || event == Event::CtrlP)) {
+            capture.open(event == Event::CtrlW ? QuickCapture::Kind::Win : QuickCapture::Kind::Park);
+            return true;
+        }
+        // Taken here, ahead of the tab menu, so they work wherever focus is
+        // within the Focus tab -- including on the menu itself.
+        if (tab_index == kFocusTabIndex && !overlay_open && focus_screen.handle_shortcut(event)) return true;
         // Returning true is the whole point here: FTXUI clears the selection
         // for any event the tree reports as handled.
         if (event == kDeselectEvent) return true;

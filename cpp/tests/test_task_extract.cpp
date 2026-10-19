@@ -110,3 +110,14 @@ TEST_CASE("due date normalization") {
     CHECK(util::normalize_due_date("n/a", "2026-08-13").empty());
     CHECK(util::normalize_due_date("", "2026-08-13").empty());
 }
+
+TEST_CASE("the spoken deadline overrides a wrongly computed date") {
+    auto j = nlohmann::json::parse(R"([{"description":"Send pricing","due_date":"2026-10-21","due_said":"by Friday"},
+                                       {"description":"Book demo","due_date":"","due_said":"next week"},
+                                       {"description":"Call back","due_date":"2026-10-30","due_said":""}])");
+    auto tasks = callscribe::llm::parse_task_items(j, "Acme", "2026-10-19");
+    REQUIRE(tasks.size() == 3);
+    CHECK(tasks[0].due_date == "2026-10-23");
+    CHECK(tasks[1].due_date.empty());
+    CHECK(tasks[2].due_date == "2026-10-30");
+}

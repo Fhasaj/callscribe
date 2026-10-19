@@ -9,6 +9,7 @@
 #include "ui/styled_input.hpp"
 #include "ui/task_meta.hpp"
 #include "ui/theme.hpp"
+#include "ui/widgets.hpp"
 #include "ui/wrapped_input.hpp"
 #include "util/clipboard.hpp"
 #include "util/date_format.hpp"
@@ -104,10 +105,10 @@ void HistoryScreen::save_current_notes() {
 
 void HistoryScreen::regenerate() {
     if (selected_ < 0 || selected_ >= static_cast<int>(calls_.size())) return;
-    std::string model = ctx_.settings.ollama_model;
+    std::string model = ctx_.settings.llm_model();
     if (model.empty()) {
         std::lock_guard<std::mutex> lock(detail_mutex_);
-        status_message_ = "No Ollama model selected -- pick one in Settings.";
+        status_message_ = "No AI model selected -- pick one in Settings.";
         return;
     }
     if (regen_thread_.joinable()) regen_thread_.join();
@@ -120,7 +121,7 @@ void HistoryScreen::regenerate() {
     regen_thread_ = std::thread([this, call, model] {
         std::string transcript = ctx_.repo->render_transcript(call.id);
         try {
-            auto result = llm::summarize_call(ctx_.settings.ollama_host, model, transcript, call.customer_name,
+            auto result = llm::summarize_call(ctx_.settings.llm_host(), model, transcript, call.customer_name,
                                                call.meeting_name, call.participants,
                                                util::iso_date_to_display(call.started_at.substr(0, 10)),
                                                [this](const std::string& phase) {
@@ -129,7 +130,8 @@ void HistoryScreen::regenerate() {
                                                },
                                                llm::PromptPresets{ctx_.settings.summary_prompt,
                                                                   ctx_.settings.email_prompt,
-                                                                  ctx_.settings.tasks_prompt});
+                                                                  ctx_.settings.tasks_prompt},
+                                           ctx_.settings.user_display_name);
             for (auto& t : result.tasks) {
                 std::optional<int64_t> task_customer = call.customer_id;
                 if (!t.customer.empty() && t.customer != call.customer_name)
@@ -163,26 +165,26 @@ void HistoryScreen::build_ui() {
     search_opt.multiline = false;
     search_opt.on_enter = [this] { refresh_list(); };
     auto search_input = WrappedInput(&search_text_, "Search transcript or customer...", search_opt);
-    auto search_button = Button("Search", [this] { refresh_list(); }, ButtonOption::Animated(theme::kAccent));
+    auto search_button = Button("Search", [this] { refresh_list(); }, button_style(theme::kAccent));
 
     MenuOption menu_opt = MenuOption::Vertical();
     menu_opt.on_change = [this] { load_detail(); };
     auto call_menu = Menu(&call_labels_, &selected_, menu_opt);
 
     auto regen_button =
-        Button("Re-generate summary", [this] { regenerate(); }, ButtonOption::Animated(theme::kAccent));
+        Button("Re-generate summary", [this] { regenerate(); }, button_style(theme::kAccent));
     auto copy_transcript_btn = Button("Copy Transcript", [this] {
         std::lock_guard<std::mutex> lock(detail_mutex_);
         util::copy_to_clipboard(transcript_);
-    });
+    }, button_style(theme::kMuted));
     auto copy_summary_btn = Button("Copy Summary", [this] {
         std::lock_guard<std::mutex> lock(detail_mutex_);
         util::copy_to_clipboard(summary_);
-    });
+    }, button_style(theme::kMuted));
     auto copy_email_btn = Button("Copy Email", [this] {
         std::lock_guard<std::mutex> lock(detail_mutex_);
         util::copy_to_clipboard(email_);
-    });
+    }, button_style(theme::kMuted));
 
     auto left = Container::Vertical({
         Container::Horizontal({search_input, search_button}),
@@ -198,7 +200,7 @@ void HistoryScreen::build_ui() {
     auto transcript_page =
         Renderer(Container::Vertical({transcript_pane, copy_transcript_btn}),
                  [transcript_pane, copy_transcript_btn] {
-                     return vbox({transcript_pane->Render() | flex, copy_transcript_btn->Render()}) | flex;
+                     return vbox({transcript_pane->Render() | flex, hbox({filler(), copy_transcript_btn->Render()})}) | flex;
                  });
 
     InputOption notes_opt;
@@ -210,12 +212,12 @@ void HistoryScreen::build_ui() {
     auto copy_notes_btn = Button("Copy Notes", [this] {
         std::lock_guard<std::mutex> lock(detail_mutex_);
         util::copy_to_clipboard(notes_);
-    });
+    }, button_style(theme::kMuted));
     auto notes_page = Renderer(Container::Vertical({notes_input, copy_notes_btn}),
                                [notes_input, copy_notes_btn] {
                                    return vbox({
                                               notes_input->Render() | flex | borderStyled(ROUNDED, theme::kMuted),
-                                              copy_notes_btn->Render(),
+                                              hbox({filler(), copy_notes_btn->Render()}),
                                           }) |
                                           flex;
                                });
@@ -225,7 +227,7 @@ void HistoryScreen::build_ui() {
     new_task_opt.on_enter = [this] { add_task_for_selected(); };
     auto new_task_input = WrappedInput(&new_task_text_, "Add a task for this call...", new_task_opt);
     auto add_task_btn =
-        Button("Add Task", [this] { add_task_for_selected(); }, ButtonOption::Animated(theme::kAccent));
+        Button("Add Task", [this] { add_task_for_selected(); }, button_style(theme::kAccent));
 
     auto summary_pane = ScrollableText(
         [this] {
@@ -289,7 +291,7 @@ void HistoryScreen::build_ui() {
     auto email_page = Renderer(Container::Vertical({email_pane, copy_email_btn}), [email_pane, copy_email_btn] {
         return vbox({
                    email_pane->Render() | flex,
-                   copy_email_btn->Render(),
+                   hbox({filler(), copy_email_btn->Render()}),
                }) |
                flex;
     });
@@ -307,20 +309,18 @@ void HistoryScreen::build_ui() {
         if (ctx_.repo->revision() != seen_revision_) refresh_list();
 
         Element left_pane = vbox({
-                                hbox({search_input->Render() | flex, search_button->Render()}),
-                                separator() | color(theme::kMuted),
-                                call_menu->Render() | frame | flex,
+                                hbox({search_input->Render() | flex, text(" "), search_button->Render()}),
+                                section("Calls", call_menu->Render() | frame | flex) | flex,
                             }) |
-                            flex | size(WIDTH, LESS_THAN, 50);
+                            size(WIDTH, EQUAL, 48);
 
         Element right_pane = vbox({
                                  inner_menu->Render(),
-                                 separator() | color(theme::kMuted),
                                  inner_tab_container->Render() | flex,
                              }) |
                              flex;
 
-        return hbox({left_pane, separator() | color(theme::kMuted), right_pane}) | flex;
+        return hbox({left_pane, text(" "), right_pane}) | flex;
     });
 }
 

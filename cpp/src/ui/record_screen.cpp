@@ -14,6 +14,7 @@
 #include "ui/styled_input.hpp"
 #include "ui/task_meta.hpp"
 #include "ui/theme.hpp"
+#include "ui/widgets.hpp"
 #include "ui/wrapped_input.hpp"
 #include "util/clipboard.hpp"
 #include "util/date_format.hpp"
@@ -68,7 +69,7 @@ void RecordScreen::build_ui() {
     // Participants get a popup rather than an inline field: names are added one
     // at a time and each can be removed on its own, which a single
     // comma-separated box made needlessly fiddly.
-    ButtonOption participants_opt = ButtonOption::Animated(theme::kAccent);
+    ButtonOption participants_opt = button_style(theme::kAccent);
     participants_opt.transform = [this](const EntryState& s) {
         std::string label = participant_list_.empty()
                                 ? " + Add participants "
@@ -93,15 +94,26 @@ void RecordScreen::build_ui() {
             else if (is_recording())
                 stop_recording();
         },
-        ButtonOption::Animated(theme::kAccent));
+        [this] {
+            // Says what it will do next, in the colour of that: green to
+            // start, red to stop.
+            ButtonOption opt;
+            opt.transform = [this](const EntryState& s) {
+                EntryState labelled = s;
+                const bool recording = is_recording();
+                labelled.label = recording ? "■ Stop recording" : "● Start recording";
+                return button_style(recording ? theme::kDanger : theme::kSuccess).transform(labelled);
+            };
+            return opt;
+        }());
 
     // Label follows the state so the button says what it will do next.
-    ButtonOption pause_opt = ButtonOption::Animated(theme::kWarning);
+    ButtonOption pause_opt;
     pause_opt.transform = [this](const EntryState& s) {
-        Element e = text(state_.load() == State::Paused ? " ▶ Resume " : " ❚❚ Pause ") | bold;
-        e |= state_.load() == State::Paused ? color(theme::kSuccess) : color(theme::kWarning);
-        if (s.focused) e |= inverted;
-        return e;
+        EntryState labelled = s;
+        const bool paused = state_.load() == State::Paused;
+        labelled.label = paused ? "▶ Resume" : "❚❚ Pause";
+        return button_style(paused ? theme::kSuccess : theme::kWarning).transform(labelled);
     };
     auto pause_button = Button("Pause", [this] { toggle_pause(); }, pause_opt);
     auto pause_slot = Maybe(pause_button, [this] { return is_recording(); });
@@ -109,16 +121,16 @@ void RecordScreen::build_ui() {
     auto copy_summary_btn = Button("Copy Summary", [this] {
         std::lock_guard<std::mutex> lock(text_mutex_);
         util::copy_to_clipboard(summary_text_);
-    });
+    }, button_style(theme::kMuted));
     auto copy_email_btn = Button("Copy Email", [this] {
         std::lock_guard<std::mutex> lock(text_mutex_);
         util::copy_to_clipboard(email_draft_);
-    });
+    }, button_style(theme::kMuted));
 
     auto copy_transcript_btn = Button("Copy Transcript", [this] {
         std::lock_guard<std::mutex> lock(text_mutex_);
         util::copy_to_clipboard(live_transcript_);
-    });
+    }, button_style(theme::kMuted));
     auto transcript_pane = ScrollableText(
         [this] {
             std::lock_guard<std::mutex> lock(text_mutex_);
@@ -127,7 +139,7 @@ void RecordScreen::build_ui() {
         "(nothing yet)");
     auto live_page = Renderer(Container::Vertical({transcript_pane, copy_transcript_btn}),
                               [transcript_pane, copy_transcript_btn] {
-                                  return vbox({transcript_pane->Render() | flex, copy_transcript_btn->Render()}) | flex;
+                                  return vbox({transcript_pane->Render() | flex, hbox({filler(), copy_transcript_btn->Render()})}) | flex;
                               });
 
     InputOption notes_opt;
@@ -138,12 +150,12 @@ void RecordScreen::build_ui() {
     auto notes_input = WrappedInput(&manual_notes_, "Type your own notes for this call here...", notes_opt);
     // An editable Input consumes clicks to place its cursor, so its text can't
     // be drag-selected the way the read-only panes can -- hence a copy button.
-    auto copy_notes_btn = Button("Copy Notes", [this] { util::copy_to_clipboard(manual_notes_); });
+    auto copy_notes_btn = Button("Copy Notes", [this] { util::copy_to_clipboard(manual_notes_); }, button_style(theme::kMuted));
     auto notes_page = Renderer(Container::Vertical({notes_input, copy_notes_btn}),
                                [notes_input, copy_notes_btn] {
                                    return vbox({
                                               notes_input->Render() | flex | borderStyled(ROUNDED, theme::kMuted),
-                                              copy_notes_btn->Render(),
+                                              hbox({filler(), copy_notes_btn->Render()}),
                                           }) |
                                           flex;
                                });
@@ -152,7 +164,7 @@ void RecordScreen::build_ui() {
     new_task_opt.multiline = false;
     new_task_opt.on_enter = [this] { add_task_for_call(); };
     auto new_task_input = WrappedInput(&new_task_text_, "Add a task for this call...", new_task_opt);
-    auto add_task_btn = Button("Add Task", [this] { add_task_for_call(); }, ButtonOption::Animated(theme::kAccent));
+    auto add_task_btn = Button("Add Task", [this] { add_task_for_call(); }, button_style(theme::kAccent));
 
     auto summary_pane = ScrollableText(
         [this] {
@@ -179,7 +191,7 @@ void RecordScreen::build_ui() {
             }
             if (task_lines.empty()) task_lines.push_back(text("(no tasks linked to this call yet)") | dim);
 
-            Elements children = {summary_pane->Render() | flex, copy_summary_btn->Render()};
+            Elements children = {summary_pane->Render() | flex, hbox({filler(), copy_summary_btn->Render()})};
             // The review panel renders itself only when there is something to
             // review, so the section is asked for its own emptiness first.
             if (!proposed_tasks_.empty()) {
@@ -202,7 +214,7 @@ void RecordScreen::build_ui() {
     auto email_page = Renderer(Container::Vertical({email_pane, copy_email_btn}), [email_pane, copy_email_btn] {
         return vbox({
                    email_pane->Render() | flex,
-                   copy_email_btn->Render(),
+                   hbox({filler(), copy_email_btn->Render()}),
                }) |
                flex;
     });
@@ -243,27 +255,34 @@ void RecordScreen::build_ui() {
         bool editable = state == State::Idle;
 
         Elements children;
-        children.push_back(text("CallScribe -- Record a call") | bold | color(theme::kAccent));
-        children.push_back(separator() | color(theme::kMuted));
-        children.push_back(hbox({text("Meeting:      "), meeting_input->Render() | flex}));
-        children.push_back(hbox({text("Customer:     "), customer_input->Render() | flex}));
-        Elements participants_row = {text("Participants: "), participants_button->Render(), text("  ")};
-        participants_row.push_back(participant_list_.empty()
-                                        ? text("(none yet)") | dim
-                                        : text(participants_) | color(theme::kMuted));
-        participants_row.push_back(filler());
-        children.push_back(hbox(std::move(participants_row)));
+        Element details = vbox({
+            hbox({
+                field_row("Meeting", meeting_input->Render(), 10) | flex,
+                text("  "),
+                field_row("Customer", customer_input->Render(), 10) | flex,
+            }),
+            hbox({
+                text("Participants") | color(Color::GrayLight) | size(WIDTH, EQUAL, 14),
+                participants_button->Render(),
+                text("  "),
+                participant_list_.empty() ? text("none yet") | dim : paragraph(participants_) | color(theme::kMuted),
+            }),
+        });
+        children.push_back(section("Call", details));
+
         Elements status_row = {start_stop_button->Render()};
         if (is_recording()) {
             status_row.push_back(text(" "));
             status_row.push_back(pause_slot->Render());
         }
         status_row.push_back(text("   "));
-        if (state == State::Recording) status_row.push_back(text("● REC ") | bold | color(theme::kDanger));
-        if (state == State::Paused) status_row.push_back(text("❚❚ PAUSED ") | bold | color(theme::kWarning));
-        status_row.push_back(text(status_text) | color(status_color));
+        if (state == State::Recording) status_row.push_back(badge("REC", theme::kDanger) | vcenter);
+        if (state == State::Paused) status_row.push_back(badge("PAUSED", theme::kWarning) | vcenter);
+        status_row.push_back(text(" " + status_text) | color(status_color) | vcenter);
         status_row.push_back(filler());
-        status_row.push_back(text(elapsed_text) | color(status_color) | (state == State::Recording ? bold : nothing));
+        status_row.push_back(text(elapsed_text) | color(status_color) | (state == State::Recording ? bold : nothing) |
+                             vcenter);
+        status_row.push_back(text(" "));
         children.push_back(hbox(status_row));
         if (state == State::Processing && !detail_copy.empty())
             children.push_back(text(detail_copy) | color(theme::kWarning));
@@ -296,9 +315,8 @@ void RecordScreen::build_ui() {
         if (!error_copy.empty()) {
             children.push_back(text(error_copy) | color(theme::kDanger));
         }
-        children.push_back(separator() | color(theme::kMuted));
+        children.push_back(text(""));
         children.push_back(inner_menu->Render());
-        children.push_back(separator() | color(theme::kMuted));
         children.push_back(inner_tab_container->Render() | flex);
 
         return vbox(children) | flex;
@@ -320,9 +338,9 @@ ftxui::Component RecordScreen::build_participants_popup() {
     add_opt.multiline = false;
     add_opt.on_enter = [this] { add_participant(); };
     auto add_input = WrappedInput(&new_participant_, "Name", add_opt);
-    auto add_btn = Button(" Add ", [this] { add_participant(); }, ButtonOption::Animated(theme::kAccent));
+    auto add_btn = Button(" Add ", [this] { add_participant(); }, button_style(theme::kAccent));
     auto done_btn = Button(
-        " Save ", [this] { participants_popup_ = false; }, ButtonOption::Animated(theme::kSuccess));
+        " Save ", [this] { participants_popup_ = false; }, button_style(theme::kSuccess));
 
     auto layout = Container::Vertical({
         Container::Horizontal({add_input, add_btn}),
@@ -718,17 +736,17 @@ void RecordScreen::finalize() {
     ctx_.repo->finish_call(call_id_, static_cast<int>(duration), wav_path, "summarizing");
 
     std::string transcript = ctx_.repo->render_transcript(call_id_);
-    std::string model = ctx_.settings.ollama_model;
+    std::string model = ctx_.settings.llm_model();
     if (model.empty()) {
         std::lock_guard<std::mutex> lock(text_mutex_);
-        error_message_ = "No Ollama model selected -- pick one in Settings.";
+        error_message_ = "No AI model selected -- pick one in Settings.";
         ctx_.repo->set_call_status(call_id_, "error");
         state_.store(State::Idle);
         return;
     }
 
     try {
-        auto result = llm::summarize_call(ctx_.settings.ollama_host, model, transcript, customer_name_,
+        auto result = llm::summarize_call(ctx_.settings.llm_host(), model, transcript, customer_name_,
                                            meeting_name_, participants_, util::iso_date_to_display(util::today_iso()),
                                            [this](const std::string& phase) {
                                                std::lock_guard<std::mutex> lock(text_mutex_);
@@ -736,7 +754,8 @@ void RecordScreen::finalize() {
                                            },
                                            llm::PromptPresets{ctx_.settings.summary_prompt,
                                                               ctx_.settings.email_prompt,
-                                                              ctx_.settings.tasks_prompt});
+                                                              ctx_.settings.tasks_prompt},
+                                           ctx_.settings.user_display_name);
         for (auto& t : result.tasks) {
             // The model can attribute a task to a customer other than the
             // call's own (a task raised about a different account); that name

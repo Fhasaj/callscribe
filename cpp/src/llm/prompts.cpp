@@ -4,13 +4,45 @@
 
 #include "config.hpp"
 #include "llm/ollama_client.hpp"  // max_prompt_chars(), to bound the chat history
+#include "util/date_format.hpp"
 
 namespace callscribe::llm {
+
+namespace {
+
+// "Monday 2026-10-19 (call day)", then the next 13 days. Models resolve "by
+// Friday" by arithmetic and get it wrong surprisingly often (two of the models
+// we use put a Friday deadline on the Wednesday); given the dates, they look
+// it up instead.
+std::string date_table(const std::string& call_date) {
+    std::string iso = util::display_date_to_iso(call_date);
+    if (iso.empty() && call_date.size() == 10 && call_date[4] == '-') iso = call_date;
+    if (iso.empty()) return "";
+    std::tm tm{};
+    tm.tm_year = std::stoi(iso.substr(0, 4)) - 1900;
+    tm.tm_mon = std::stoi(iso.substr(5, 2)) - 1;
+    tm.tm_mday = std::stoi(iso.substr(8, 2));
+    tm.tm_hour = 12;  // midday, so a DST change can't move the date
+    tm.tm_isdst = -1;
+    std::ostringstream out;
+    for (int i = 0; i < 14; ++i) {
+        std::tm day = tm;
+        day.tm_mday += i;
+        std::mktime(&day);
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%A %Y-%m-%d", &day);
+        out << (i ? ", " : "") << buf << (i == 0 ? " (call day)" : i == 1 ? " (tomorrow)" : "");
+    }
+    return out.str();
+}
+
+}  // namespace
 
 std::string build_summary_prompt(const std::string& transcript, const std::string& customer_name,
                                   const std::string& meeting_name, const std::string& participants,
                                   const std::string& call_date, const std::string& summary_instruction,
-                                  const std::string& email_instruction, const std::string& tasks_instruction) {
+                                  const std::string& email_instruction, const std::string& tasks_instruction,
+                                  const std::string& user_name) {
     std::string summary_text = summary_instruction.empty() ? kDefaultSummaryPrompt : summary_instruction;
     std::string email_text = email_instruction.empty() ? kDefaultEmailPrompt : email_instruction;
     std::string tasks_text = tasks_instruction.empty() ? kDefaultTasksPrompt : tasks_instruction;
@@ -23,21 +55,32 @@ std::string build_summary_prompt(const std::string& transcript, const std::strin
     out << "Meeting: " << (meeting_name.empty() ? "(untitled)" : meeting_name) << "\n";
     out << "Customer: " << (customer_name.empty() ? "Unknown" : customer_name) << "\n";
     out << "Participants: " << (participants.empty() ? "(not specified)" : participants) << "\n";
-    out << "Call date: " << call_date << "\n\n";
+    out << "Call date: " << call_date << "\n";
+    if (std::string dates = date_table(call_date); !dates.empty()) out << "Dates for deadlines: " << dates << "\n";
+    out << "\n";
     out << "Transcript:\n\"\"\"\n" << (transcript.empty() ? "(no speech detected)" : transcript) << "\n\"\"\"\n\n";
     out << "Respond with ONLY a JSON object (no markdown, no commentary) with exactly these keys:\n";
     out << "- \"summary\": an array of strings. " << summary_text << "\n";
     out << "- \"customer_email\": a single plain-text string. " << email_text
         << " Separate paragraphs with a blank line, but write each paragraph as one continuous "
            "line -- do not hard-wrap it to a fixed column width.\n";
+    const std::string who = user_name.empty() ? "the user" : user_name;
     out << "- \"tasks\": an array of objects, ONE OBJECT PER TASK. " << tasks_text
-        << " Each object has exactly these keys:\n"
+        << " These are " << who << "'s own to-do items"
+        << (user_name.empty() ? "" : " (their lines are labelled \"" + user_name + ":\")")
+        << ": things " << who << " committed to doing, or was asked to do and agreed to. "
+           "Leave out: things someone else will do (\"Tom will update the wiki\"), things already "
+           "done, hypotheticals (\"if we ever...\"), and pleasantries (\"we should grab coffee\"). "
+           "Each object has exactly these keys:\n"
            "    * \"description\": the action itself, one short imperative sentence (e.g. \"Send the "
            "updated pricing sheet\"). One action per object -- never combine several actions into "
            "one description.\n"
            "    * \"due_date\": the date the task is due as \"YYYY-MM-DD\". Resolve anything said "
-           "relative to the call (\"tomorrow\", \"next Friday\", \"end of the week\") against the "
-           "call date above. Use \"\" if no date was mentioned or implied -- do not guess.\n"
+           "relative to the call (\"tomorrow\", \"by Friday\", \"end of the week\") by looking it up "
+           "in the dates listed above, not by counting. \"Next week\" with no day given is \"\". "
+           "Use \"\" if no date was mentioned -- do not guess.\n"
+           "    * \"due_said\": the deadline exactly as it was said on the call (\"by Friday\", "
+           "\"tomorrow\", \"end of the week\"), or \"\" if none was said.\n"
            "    * \"priority\": exactly one of \"low\", \"medium\", \"high\". Use \"high\" for "
            "anything urgent, promised for today/tomorrow, or blocking someone; \"low\" for "
            "nice-to-haves with no deadline; \"medium\" otherwise.\n"
@@ -48,7 +91,8 @@ std::string build_summary_prompt(const std::string& transcript, const std::strin
            "objects.\n\n";
     out << "Example of the tasks value:\n"
            "  \"tasks\": [{\"description\": \"Send the updated pricing sheet\", \"due_date\": "
-           "\"2026-07-30\", \"priority\": \"high\", \"customer\": \"Acme Corp\"}]\n\n";
+           "\"2026-07-30\", \"due_said\": \"by Thursday\", \"priority\": \"high\", \"customer\": "
+           "\"Acme Corp\"}]\n\n";
     out << "If the transcript has no real content, still return valid JSON with empty/minimal values.\n";
     return out.str();
 }
@@ -102,46 +146,79 @@ std::string build_yearly_narrative_prompt(int year, const std::vector<std::strin
     return out.str();
 }
 
-std::string build_review_report_prompt(int year, const std::string& cycle_label,
-                                        const std::vector<std::string>& questions,
-                                        const std::vector<std::string>& summaries, int call_count,
-                                        long long total_seconds, int tasks_completed,
-                                        const std::vector<std::pair<std::string, int>>& top_customers) {
+std::string build_review_report_prompt(const std::string& user_name, const std::string& cycle_label,
+                                       const std::vector<std::string>& questions, const ReviewFacts& facts,
+                                       const std::vector<EvidenceItem>& evidence, size_t evidence_total) {
     std::ostringstream out;
-    out << "You are helping a salesperson/account manager draft their " << cycle_label
-        << " performance review self-assessment, using their own call notes from " << year
-        << " as the evidence base.\n\n";
-    out << "Activity for " << year << ":\n";
-    out << "- Total calls: " << call_count << "\n";
-    out << "- Total call time: " << (total_seconds / 3600.0) << " hours\n";
-    out << "- Tasks completed: " << tasks_completed << "\n";
-    out << "- Top customers by call count: ";
-    if (top_customers.empty()) {
-        out << "n/a";
-    } else {
-        for (size_t i = 0; i < top_customers.size() && i < 5; ++i) {
+    const std::string who = user_name.empty() ? "the user" : user_name;
+    out << "You are helping " << who << " write their "
+        << (cycle_label.empty() ? "" : cycle_label + " ") << "performance review self-assessment for "
+        << facts.period << ". The answers will be pasted straight into the review form, and the goal is "
+        << "a review that makes a clear, honest case for their impact -- the kind that supports a raise.\n\n";
+
+    out << "Facts for " << facts.period << " (exact -- quote these, never estimate your own):\n";
+    out << "- Calls: " << facts.call_count << ", totalling " << (facts.call_seconds / 3600) << "h "
+        << (facts.call_seconds % 3600) / 60 << "m\n";
+    out << "- Tasks completed: " << facts.tasks_completed << "\n";
+    out << "- Wins logged: " << facts.wins << "\n";
+    if (!facts.top_customers.empty()) {
+        out << "- Most-called customers: ";
+        for (size_t i = 0; i < facts.top_customers.size() && i < 5; ++i) {
             if (i) out << ", ";
-            out << top_customers[i].first;
+            out << facts.top_customers[i].first << " (" << facts.top_customers[i].second << " calls)";
         }
+        out << "\n";
     }
-    out << "\n\nCall summary bullets from throughout the year:\n";
-    if (summaries.empty()) {
-        out << "(no call summaries recorded)\n";
-    } else {
-        size_t limit = summaries.size() < 200 ? summaries.size() : 200;
-        for (size_t i = 0; i < limit; ++i) out << "- " << summaries[i] << "\n";
+    if (!facts.focus_seconds_by_tag.empty()) {
+        out << "- Focused work time by project: ";
+        for (size_t i = 0; i < facts.focus_seconds_by_tag.size(); ++i) {
+            if (i) out << ", ";
+            out << facts.focus_seconds_by_tag[i].first << " " << (facts.focus_seconds_by_tag[i].second + 1800) / 3600
+                << "h";
+        }
+        out << "\n";
     }
 
-    out << "\nAnswer each of the following review questions, in order:\n";
+    out << "\nEvidence, one item per line (date · kind · note)";
+    if (evidence.size() < evidence_total)
+        out << " -- the " << evidence.size() << " most relevant of " << evidence_total << " items";
+    out << ":\n";
+    if (evidence.empty()) out << "(nothing recorded for this period)\n";
+    for (const auto& item : evidence) out << "- " << render_evidence_line(item) << "\n";
+
+    out << "\nAnswer each of these questions, in order:\n";
     for (size_t i = 0; i < questions.size(); ++i) out << (i + 1) << ". " << questions[i] << "\n";
 
-    out << "\nWrite the answers in the first person, as the person being reviewed. For each "
-           "question, repeat the question as a plain-text heading line, then give 2-4 short "
-           "paragraphs or bullets answering it. Ground every claim in the activity and call notes "
-           "above -- cite concrete customers, deals, or action items where you can, and do not "
-           "invent specifics that aren't supported. If the notes don't support an answer to a "
-           "question, say plainly what evidence is missing rather than making something up. Plain "
-           "text, no markdown headers.\n";
+    out << "\nHow to write the answers:\n"
+           "- First person, as " << who << ", in a confident, plain professional voice. No hype words.\n"
+           "- Put each question on its own line, then the answer under it: 2-4 short paragraphs or bullets.\n"
+           "- Build every point on the evidence: name the customer, the month, what was done and what it "
+           "led to. Specific beats general -- \"resolved Acme's onboarding blocker in March, which let them "
+           "go live\" beats \"good at solving problems\".\n"
+           "- Lead with impact and initiative: outcomes for customers and the team, things done without "
+           "being asked, problems prevented.\n"
+           "- Use only numbers from the facts or the evidence. Never invent figures, percentages, revenue "
+           "or names.\n"
+           "- For questions about weaknesses or growth, be honest and constructive: name a real area and "
+           "what's being done about it, drawn from the evidence where possible.\n"
+           "- If the evidence can't support an answer, write what you can and add one line starting "
+           "\"Evidence gap:\" saying what's missing, rather than filling the gap with something made up.\n"
+           "- Plain text: no markdown headers, no bold, no preamble or sign-off.\n";
+    return out.str();
+}
+
+std::string build_task_breakdown_prompt(const std::string& task, const std::string& customer,
+                                        const std::string& due_date) {
+    std::ostringstream out;
+    out << "Break this work task into 3 to 5 small, concrete next steps.\n\n";
+    out << "Task: " << task << "\n";
+    if (!customer.empty()) out << "Customer: " << customer << "\n";
+    if (!due_date.empty()) out << "Due: " << due_date << "\n";
+    out << "\nEach step must be something that can be started right now without further planning, and "
+           "finished in under about 30 minutes. Start each with a verb (\"Draft...\", \"Email...\", "
+           "\"List...\"). The first step should be the easiest possible way in. Only use details given "
+           "above -- don't invent names, systems or facts.\n\n";
+    out << "Reply with JSON only: {\"steps\": [\"first step\", \"second step\", ...]}\n";
     return out.str();
 }
 

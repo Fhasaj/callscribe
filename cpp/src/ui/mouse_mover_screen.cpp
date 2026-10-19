@@ -8,6 +8,7 @@
 
 #include "ui/styled_input.hpp"
 #include "ui/theme.hpp"
+#include "ui/widgets.hpp"
 #include "ui/wrapped_input.hpp"
 
 namespace callscribe::ui {
@@ -154,7 +155,15 @@ void MouseMoverScreen::build_ui() {
             else
                 start();
         },
-        ButtonOption::Animated(theme::kAccent));
+        [this] {
+            ButtonOption opt;
+            opt.transform = [this](const EntryState& s) {
+                EntryState labelled = s;
+                labelled.label = running_.load() ? "■ Stop" : "▶ Start";
+                return button_style(running_.load() ? theme::kDanger : theme::kSuccess).transform(labelled);
+            };
+            return opt;
+        }());
 
     auto nudge_button = Button(
         "Nudge now",
@@ -172,7 +181,7 @@ void MouseMoverScreen::build_ui() {
             set_status(ok ? "Nudged." : "The virtual pointer rejected the move.");
             if (!running_.load()) pointer_.close();
         },
-        ButtonOption::Animated(theme::kMuted));
+        button_style(theme::kMuted));
 
     auto layout = Container::Vertical({
         Container::Horizontal({interval_input, distance_input}),
@@ -197,43 +206,37 @@ void MouseMoverScreen::build_ui() {
         const bool active = running_.load();
 
         Elements children;
-        children.push_back(text("CallScribe -- Mouse Mover") | bold | color(theme::kAccent));
-        children.push_back(separator() | color(theme::kMuted));
         children.push_back(paragraph("Moves the pointer a few pixels on a timer so the session never goes idle "
                                      "and Teams keeps showing you as Available. Wayland has no pointer-warp API "
                                      "for apps, so this registers a virtual mouse with the kernel (/dev/uinput) "
                                      "and sends real input events through it.") |
                            dim);
-        children.push_back(separator() | color(theme::kMuted));
-
+        children.push_back(text(""));
         children.push_back(hbox({
-            vbox({text("Move every (seconds)") | dim, interval_input->Render()}) | size(WIDTH, EQUAL, 26),
-            text("  "),
-            vbox({text("Distance (pixels)") | dim, distance_input->Render()}) | size(WIDTH, EQUAL, 26),
+            field_row("Move every (s)", interval_input->Render() | size(WIDTH, EQUAL, 12), 15),
+            text("    "),
+            field_row("Distance (px)", distance_input->Render() | size(WIDTH, EQUAL, 12), 15),
+            filler(),
         }));
         children.push_back(autostart_checkbox->Render());
         children.push_back(text(""));
-
-        Element state_badge = active ? (text(" ACTIVE ") | bold | color(theme::kSuccess) | inverted)
-                                     : (text(" INACTIVE ") | bold | color(theme::kMuted) | inverted);
         children.push_back(hbox({
             toggle_button->Render(),
-            text("  "),
+            text(" "),
             nudge_button->Render(),
-            text("  "),
-            state_badge,
+            text("   "),
+            (active ? badge("Active", theme::kSuccess) : badge("Inactive", theme::kMuted)) | vcenter,
+            filler(),
         }));
-        children.push_back(text(""));
-
-        children.push_back(paragraph(status_copy) | color(active ? theme::kSuccess : theme::kMuted));
+        Elements status = {paragraph(status_copy) | color(active ? theme::kSuccess : theme::kMuted)};
         if (active) {
             std::string line = "Nudges so far: " + std::to_string(moves);
             if (seconds_left >= 0) line += "   next in ~" + std::to_string(seconds_left) + "s";
-            children.push_back(text(line) | color(theme::kWarning));
+            status.push_back(text(line) | color(theme::kWarning));
         }
-
-        children.push_back(filler());
-        return vbox(children) | flex;
+        children.push_back(vbox(std::move(status)));
+        Element page = section("Mouse Mover", vbox(std::move(children)));
+        return vbox({page, filler()}) | flex;
     });
 }
 

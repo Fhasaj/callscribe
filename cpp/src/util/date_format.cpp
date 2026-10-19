@@ -116,4 +116,27 @@ std::string normalize_due_date(const std::string& text, const std::string& refer
     return display_date_to_iso(s);
 }
 
+std::string resolve_spoken_deadline(const std::string& phrase, const std::string& reference_iso) {
+    std::string s = lower_trim(phrase);
+    while (!s.empty() && (s.back() == '.' || s.back() == ',' || s.back() == '!')) s.pop_back();
+    for (const char* lead : {"by ", "on ", "before ", "until ", "till ", "for ", "this coming ", "coming "}) {
+        const std::string l = lead;
+        if (s.rfind(l, 0) == 0) s = lower_trim(s.substr(l.size()));
+    }
+    if (s == "the end of the week" || s == "end of the week" || s == "end of this week" || s == "the end of this week")
+        s = "end of week";
+    if (s == "end of today" || s == "end of day" || s == "eod" || s == "the end of the day" || s == "end of the day" ||
+        s == "close of business" ||
+        s == "cob")
+        s = "today";
+
+    static const char* kSpecific[] = {"today",   "tomorrow",  "end of week", "monday", "tuesday", "wednesday",
+                                      "thursday", "friday",   "saturday",    "sunday"};
+    for (const char* day : kSpecific) {
+        const std::string d = day;
+        if (s == d || s == "this " + d || s == "next " + d) return normalize_due_date(s, reference_iso);
+    }
+    return "";
+}
+
 }  // namespace callscribe::util

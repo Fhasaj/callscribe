@@ -7,6 +7,8 @@
 #include "config.hpp"
 #include "db/database.hpp"
 #include "db/repository.hpp"
+#include "spotify/spotify_client.hpp"
+#include "tasks/meeting_reminder.hpp"
 #include "tasks/reminder.hpp"
 #include "transcription/whisper_engine.hpp"
 
@@ -28,6 +30,9 @@ public:
     std::unique_ptr<db::Database> database;
     std::unique_ptr<db::Repository> repo;
     std::unique_ptr<tasks::ReminderScheduler> reminder;
+    std::unique_ptr<tasks::MeetingReminder> meeting_reminder;
+    // Always present; inert until a client ID is configured in Settings.
+    std::unique_ptr<callscribe::spotify::SpotifyClient> spotify;
 
     void preload_whisper();
     void reload_whisper();  // call after a Settings change to model size
@@ -46,7 +51,19 @@ public:
 
     void save_settings();
 
+    // llama-server's --api-key, from the keyring. Loaded at startup when
+    // llama.cpp is the backend in use; set_llamacpp_api_key() stores (or, when
+    // empty, removes) it and returns an error message, "" on success.
+    std::string llamacpp_api_key() const;
+    std::string set_llamacpp_api_key(const std::string& key);
+    // Loads it if that hasn't happened yet (llama.cpp just got selected).
+    void load_llamacpp_api_key();
+
 private:
+    mutable std::mutex api_key_mutex_;
+    std::string llamacpp_api_key_;
+    bool api_key_loaded_ = false;
+
     mutable std::mutex whisper_mutex_;
     std::shared_ptr<transcription::WhisperModel> whisper_model_;
     std::unique_ptr<transcription::WhisperEngine> mic_engine_;

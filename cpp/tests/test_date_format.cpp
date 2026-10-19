@@ -29,3 +29,16 @@ TEST_CASE("display_date_to_iso rejects invalid dates") {
 TEST_CASE("date round-trips through both conversions") {
     CHECK(display_date_to_iso(iso_date_to_display("2026-07-28")) == "2026-07-28");
 }
+
+TEST_CASE("spoken deadlines resolve to the right day, vague ones don't") {
+    const std::string monday = "2026-10-19";
+    CHECK(resolve_spoken_deadline("by Friday", monday) == "2026-10-23");
+    CHECK(resolve_spoken_deadline("Friday.", monday) == "2026-10-23");
+    CHECK(resolve_spoken_deadline("tomorrow", monday) == "2026-10-20");
+    CHECK(resolve_spoken_deadline("on Thursday", monday) == "2026-10-22");
+    CHECK(resolve_spoken_deadline("by the end of the week", monday) == "2026-10-23");
+    CHECK(resolve_spoken_deadline("end of day", monday) == "2026-10-19");
+    CHECK(resolve_spoken_deadline("next week", monday).empty());
+    CHECK(resolve_spoken_deadline("soon", monday).empty());
+    CHECK(resolve_spoken_deadline("", monday).empty());
+}

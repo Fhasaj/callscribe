@@ -12,6 +12,7 @@
 #include "ui/spinner.hpp"
 #include "ui/text_wrap.hpp"
 #include "ui/theme.hpp"
+#include "ui/widgets.hpp"
 #include "ui/wrapped_input.hpp"
 
 namespace callscribe::ui {
@@ -67,10 +68,10 @@ void ChatScreen::send() {
     std::string message = input_text_;
     if (message.find_first_not_of(" \t\r\n") == std::string::npos) return;  // nothing but whitespace
 
-    const std::string model = ctx_.settings.ollama_model;
+    const std::string model = ctx_.settings.llm_model();
     if (model.empty()) {
         std::lock_guard<std::mutex> lock(mutex_);
-        status_message_ = "No Ollama model selected -- pick one in Settings.";
+        status_message_ = "No AI model selected -- pick one in Settings.";
         return;
     }
 
@@ -109,8 +110,8 @@ void ChatScreen::send() {
         std::string error_text;
         try {
             reply = (mode == kProofread)
-                        ? llm::proofread_email(ctx_.settings.ollama_host, model, message, on_progress)
-                        : llm::chat_reply(ctx_.settings.ollama_host, model, history, message,
+                        ? llm::proofread_email(ctx_.settings.llm_host(), model, message, on_progress)
+                        : llm::chat_reply(ctx_.settings.llm_host(), model, history, message,
                                           ctx_.settings.user_display_name, on_progress);
         } catch (const std::exception& e) {
             error_text = e.what();
@@ -143,8 +144,8 @@ void ChatScreen::build_ui() {
     // newline AND fires on_enter on every Return, which would send
     // mid-paste/mid-compose. Submission is via the explicit Send button.
     auto input_box = WrappedInput(&input_text_, "Type a message, or paste an email to proofread...", input_opt);
-    auto send_button = Button("Send", [this] { send(); }, ButtonOption::Animated(theme::kAccent));
-    auto clear_button = Button("Clear", [this] { clear_conversation(); }, ButtonOption::Animated(theme::kMuted));
+    auto send_button = Button("Send", [this] { send(); }, button_style(theme::kAccent));
+    auto clear_button = Button("Clear", [this] { clear_conversation(); }, button_style(theme::kMuted));
 
     auto chat_pane = ScrollableContent(
         [this](int width) {
@@ -220,15 +221,13 @@ void ChatScreen::build_ui() {
 
         Elements children;
         children.push_back(hbox({
-            text("CallScribe -- Chat") | bold | color(theme::kAccent),
-            text("   Mode: ") | dim,
+            text("Mode ") | color(Color::GrayLight) | vcenter,
             mode_dropdown->Render() | size(WIDTH, EQUAL, 16),
+            text("  " + std::string(mode_copy == kProofread
+                                        ? "Each message is proofread on its own -- earlier ones are not context."
+                                        : "A running conversation; earlier turns are sent along as context.")) |
+                dim | vcenter,
         }));
-        children.push_back(text(mode_copy == kProofread
-                                    ? "Each message is proofread on its own -- earlier ones are not context."
-                                    : "A running conversation; earlier turns are sent along as context.") |
-                           dim);
-        children.push_back(separator() | color(theme::kMuted));
         children.push_back(chat_pane->Render() | flex | reflect(pane_box_));
 
         if (sending_now) {

@@ -17,6 +17,9 @@ struct ExtractedTask {
     std::string due_date;
     std::string priority = db::kPriorityMedium;
     std::string customer;
+    // The deadline in the words used on the call ("by Friday"), when the model
+    // reports it -- resolved here rather than trusting the model's own date.
+    std::string due_said;
 };
 
 struct CallSummaryResult {
@@ -52,16 +55,45 @@ CallSummaryResult summarize_call(const std::string& host, const std::string& mod
                                   const std::string& customer_name, const std::string& meeting_name,
                                   const std::string& participants, const std::string& call_date,
                                   const std::function<void(const std::string&)>& on_progress = nullptr,
-                                  const PromptPresets& prompts = {});
+                                  const PromptPresets& prompts = {}, const std::string& user_name = "");
 
 std::string generate_yearly_narrative(const std::string& host, const std::string& model, int year,
                                        const db::YearlyStats& stats);
 
-// Answers the review questions picked in the Yearly Summary wizard against the
-// year's call history. `cycle_label` is "semi-annual" or "annual".
-std::string generate_review_report(const std::string& host, const std::string& model, int year,
+// Answers performance-review questions from everything recorded in the
+// period: picks as much of `evidence` as the model's context holds (see
+// select_evidence) and writes paste-ready answers. `cycle_label` is
+// "semi-annual", "annual", or "" for a question of the user's own.
+// Everything recorded for one calendar year, as review material: the facts
+// and one evidence item per call note, completed task, win, noted focus round
+// and daily note. Wins and daily notes are pinned (see EvidenceItem).
+struct ReviewMaterial {
+    ReviewFacts facts;
+    std::vector<EvidenceItem> evidence;
+};
+ReviewMaterial collect_review_material(db::Repository& repo, int year);
+
+// Splits pasted review questions apart: on blank lines, or -- for a block of
+// one-line questions with no blank lines between them -- one per line.
+std::vector<std::string> split_questions(const std::string& text);
+
+struct ReviewReport {
+    std::string text;
+    size_t evidence_used = 0;
+    size_t evidence_total = 0;
+};
+ReviewReport generate_review_report(const std::string& host, const std::string& model, const std::string& user_name,
                                     const std::string& cycle_label, const std::vector<std::string>& questions,
-                                    const db::YearlyStats& stats);
+                                    const ReviewFacts& facts, std::vector<EvidenceItem> evidence);
+
+// Pulls the step list out of a breakdown reply: {"steps": [...]} of strings
+// or of objects with a "step"/"description"/"title", tolerating the same
+// list-in-one-string shapes parse_task_items() does. Empty entries dropped.
+std::vector<std::string> parse_steps(const nlohmann::json& reply);
+
+// Asks the model for the first few concrete steps of `task`.
+std::vector<std::string> break_down_task(const std::string& host, const std::string& model, const std::string& task,
+                                         const std::string& customer, const std::string& due_date);
 
 // The two Chat-screen entry points. Both return the model's reasoning
 // alongside the answer (empty for models that don't reason) and report

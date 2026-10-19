@@ -612,6 +612,8 @@ RawEvent parse_vevent(const std::vector<std::string>& lines) {
             if (upper(trim(p.value)) == "CANCELLED") ev.cancelled = true;
         } else if (p.name == "TRANSP") {
             ev.tmpl.busy = upper(trim(p.value)) != "TRANSPARENT";
+        } else if (p.name == "X-MICROSOFT-CDO-BUSYSTATUS") {
+            ev.tmpl.out_of_office = upper(trim(p.value)) == "OOF";
         } else if (p.name == "DTSTART") {
             Civil c;
             bool is_utc = false, date_only = false;

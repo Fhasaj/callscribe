@@ -15,6 +15,13 @@ set(FETCHCONTENT_QUIET OFF)
 
 find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
+# PKCE for the Spotify login (SHA-256 + a CSPRNG). libcurl already pulls
+# OpenSSL in on every distro we target, so this adds no new package.
+find_package(OpenSSL REQUIRED)
+# The Spotify refresh token lives in the desktop keyring (Secret Service),
+# not on disk: libsecret-devel on Fedora, libsecret on Arch.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBSECRET REQUIRED IMPORTED_TARGET libsecret-1)
 
 # -- SQLite3 -- vendored amalgamation (no system sqlite-devel required,
 # keeps setup identical across machines without needing sudo) -----------
@@ -117,6 +124,7 @@ add_library(callscribe_core STATIC
   src/util/wav_writer.cpp
   src/util/download.cpp
   src/util/date_format.cpp
+  src/util/keyring.cpp
   src/db/database.cpp
   src/db/repository.cpp
   src/audio/devices.cpp
@@ -129,14 +137,24 @@ add_library(callscribe_core STATIC
   src/calendar/call_match.cpp
   src/llm/ollama_client.cpp
   src/llm/prompts.cpp
+  src/llm/evidence.cpp
   src/llm/summarizer.cpp
   src/tasks/reminder.cpp
+  src/tasks/day_digest.cpp
+  src/tasks/meeting_reminder.cpp
+  src/focus/pomodoro.cpp
+  src/spotify/pkce.cpp
+  src/spotify/keyring.cpp
+  src/spotify/callback_listener.cpp
+  src/spotify/spotify_client.cpp
 )
 target_include_directories(callscribe_core PUBLIC src)
 target_link_libraries(callscribe_core PUBLIC
   nlohmann_json::nlohmann_json
   sqlite3
   CURL::libcurl
+  OpenSSL::Crypto
+  PkgConfig::LIBSECRET
   whisper
   sherpa-onnx-c-api
   Threads::Threads
@@ -157,6 +175,9 @@ add_executable(callscribe
   src/ui/summary_screen.cpp
   src/ui/chat_screen.cpp
   src/ui/mouse_mover_screen.cpp
+  src/ui/focus_screen.cpp
+  src/ui/quick_capture.cpp
+  src/ui/today_screen.cpp
   src/ui/settings_screen.cpp
 )
 target_link_libraries(callscribe PRIVATE
@@ -184,6 +205,10 @@ if(CALLSCRIBE_BUILD_TESTS)
     tests/test_task_extract.cpp
     tests/test_text_wrap.cpp
     tests/test_diarizer.cpp
+    tests/test_pomodoro.cpp
+    tests/test_spotify_pkce.cpp
+    tests/test_review.cpp
+    tests/test_meeting_reminder.cpp
     src/ui/text_wrap.cpp
   )
   target_link_libraries(callscribe_tests PRIVATE callscribe_core doctest::doctest ftxui::dom ftxui::screen)

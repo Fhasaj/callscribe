@@ -7,13 +7,18 @@
 
 #include "audio/devices.hpp"
 #include "config.hpp"
+#include "focus/pomodoro.hpp"
 #include "llm/ollama_client.hpp"
+#include "spotify/pkce.hpp"
 #include "transcription/diarizer.hpp"
 #include "transcription/whisper_engine.hpp"
 #include "ui/level_meter.hpp"
+#include "ui/scroll_pane.hpp"
 #include "ui/styled_input.hpp"
 #include "ui/theme.hpp"
+#include "ui/widgets.hpp"
 #include "ui/wrapped_input.hpp"
+#include "util/time.hpp"
 
 namespace callscribe::ui {
 
@@ -31,6 +36,18 @@ std::string format_bytes(int64_t bytes) {
 // A progress bar for one transfer. Servers do not always send a content
 // length, so "how far along" is not always answerable -- in that case the
 // bytes so far are shown on their own rather than a bar pretending to know.
+// Tolerant of stray spaces and of the field being cleared mid-edit; anything
+// unparseable keeps `fallback`.
+int parse_int(const std::string& text, int fallback) {
+    try {
+        size_t consumed = 0;
+        int value = std::stoi(text, &consumed);
+        return consumed == 0 ? fallback : value;
+    } catch (const std::exception&) {
+        return fallback;
+    }
+}
+
 ftxui::Element download_progress(int64_t done, int64_t total) {
     using namespace ftxui;
     if (total <= 0) return text("  " + format_bytes(done) + " downloaded...") | color(theme::kAccent);
@@ -55,6 +72,19 @@ SettingsScreen::SettingsScreen(AppContext& ctx) : ctx_(ctx) {
     echo_cancel_ = ctx_.settings.echo_cancel;
     detect_speaker_turns_ = ctx_.settings.detect_speaker_turns;
     diarize_far_end_ = ctx_.settings.diarize_far_end;
+    llm_backend_index_ = ctx_.settings.uses_llamacpp() ? 1 : 0;
+    llamacpp_host_ = ctx_.settings.llamacpp_host;
+    llamacpp_api_key_ = ctx_.llamacpp_api_key();
+    focus_minutes_ = std::to_string(ctx_.settings.focus_minutes);
+    short_break_minutes_ = std::to_string(ctx_.settings.short_break_minutes);
+    long_break_minutes_ = std::to_string(ctx_.settings.long_break_minutes);
+    hyperfocus_minutes_ = std::to_string(ctx_.settings.hyperfocus_nudge_minutes);
+    meeting_reminder_minutes_ = std::to_string(ctx_.settings.meeting_reminder_minutes);
+    end_of_day_time_ = ctx_.settings.end_of_day_time;
+    end_of_day_enabled_ = ctx_.settings.end_of_day_enabled;
+    spotify_client_id_ = ctx_.settings.spotify_client_id;
+    spotify_port_ = std::to_string(ctx_.settings.spotify_redirect_port);
+    spotify_playlist_ = ctx_.settings.spotify_playlist_uri;
     summary_prompt_ = ctx_.settings.summary_prompt;
     email_prompt_ = ctx_.settings.email_prompt;
     tasks_prompt_ = ctx_.settings.tasks_prompt;
@@ -66,7 +96,10 @@ SettingsScreen::SettingsScreen(AppContext& ctx) : ctx_(ctx) {
     }
 
     build_ui();
-    refresh_models();
+    if (ctx_.settings.uses_llamacpp())
+        check_llamacpp();  // also learns the context size before the first long call
+    else
+        refresh_models();
     refresh_audio_devices();
 }
 
@@ -77,7 +110,34 @@ SettingsScreen::~SettingsScreen() {
     if (diarization_download_thread_.joinable()) diarization_download_thread_.join();
 }
 
+void SettingsScreen::check_llamacpp() {
+    ctx_.settings.llm_backend = "llamacpp";
+    ctx_.settings.llamacpp_host = llamacpp_host_.empty() ? kLlamaCppHostDefault : llamacpp_host_;
+    llamacpp_host_ = ctx_.settings.llamacpp_host;
+    ctx_.save_settings();
+    // First time llama.cpp is picked this run: the stored key hasn't been read.
+    ctx_.load_llamacpp_api_key();
+    if (llamacpp_api_key_.empty()) llamacpp_api_key_ = ctx_.llamacpp_api_key();
+    if (std::string err = ctx_.set_llamacpp_api_key(llamacpp_api_key_); !err.empty()) {
+        llamacpp_status_ = err;
+        return;
+    }
+    try {
+        auto models = llm::list_models(ctx_.settings.llamacpp_host);
+        long context = llm::refresh_server_context(ctx_.settings.llamacpp_host);
+        ctx_.settings.llamacpp_model = models.empty() ? "" : models.front();
+        ctx_.save_settings();
+        llamacpp_status_ = "Connected" + (models.empty() ? std::string() : " -- " + models.front()) +
+                           (context > 0 ? " · " + std::to_string(context) + "-token context" : "");
+    } catch (const std::exception& e) {
+        llamacpp_status_ = "Can't reach llama-server at " + ctx_.settings.llamacpp_host + ": " + e.what();
+    }
+}
+
 void SettingsScreen::refresh_models() {
+    // The Ollama list is asked of Ollama even while llama.cpp is selected:
+    // it's the Ollama section being refreshed.
+    if (ctx_.settings.uses_llamacpp()) return;
     std::string status;
     try {
         ollama_models_ = llm::list_models(ctx_.settings.ollama_host);
@@ -275,10 +335,54 @@ void SettingsScreen::download_diarization_models() {
     });
 }
 
+void SettingsScreen::apply_focus_and_spotify_fields() {
+    auto minutes = [](std::string& field, int& target) {
+        target = std::clamp(parse_int(field, target), focus::kMinMinutes, focus::kMaxMinutes);
+        field = std::to_string(target);  // show what will actually run
+    };
+    minutes(focus_minutes_, ctx_.settings.focus_minutes);
+    minutes(short_break_minutes_, ctx_.settings.short_break_minutes);
+    minutes(long_break_minutes_, ctx_.settings.long_break_minutes);
+    ctx_.settings.hyperfocus_nudge_minutes =
+        std::clamp(parse_int(hyperfocus_minutes_, ctx_.settings.hyperfocus_nudge_minutes), 0, 600);
+    hyperfocus_minutes_ = std::to_string(ctx_.settings.hyperfocus_nudge_minutes);
+    if (!end_of_day_time_.empty()) ctx_.settings.end_of_day_time = end_of_day_time_;
+    ctx_.settings.end_of_day_enabled = end_of_day_enabled_;
+    ctx_.reminder->set_end_of_day(ctx_.settings.end_of_day_time, ctx_.settings.end_of_day_enabled);
+    ctx_.settings.meeting_reminder_minutes =
+        std::clamp(parse_int(meeting_reminder_minutes_, ctx_.settings.meeting_reminder_minutes), 0, 120);
+    meeting_reminder_minutes_ = std::to_string(ctx_.settings.meeting_reminder_minutes);
+    ctx_.meeting_reminder->set_lead_minutes(ctx_.settings.meeting_reminder_minutes);
+
+    auto trimmed = [](const std::string& v) {
+        size_t b = v.find_first_not_of(" \t");
+        return b == std::string::npos ? std::string() : v.substr(b, v.find_last_not_of(" \t") - b + 1);
+    };
+    spotify_client_id_ = trimmed(spotify_client_id_);
+    ctx_.settings.spotify_client_id = spotify_client_id_;
+    ctx_.settings.spotify_redirect_port =
+        std::clamp(parse_int(spotify_port_, ctx_.settings.spotify_redirect_port), 1024, 65535);
+    spotify_port_ = std::to_string(ctx_.settings.spotify_redirect_port);
+    // Stored as the canonical URI, so a pasted share link (?si=...) is tidied
+    // up once here rather than on every play.
+    std::string playlist = trimmed(spotify_playlist_);
+    std::string uri = spotify::normalize_playlist_uri(playlist);
+    if (!playlist.empty() && uri.empty()) {
+        spotify_note_ = "That doesn't look like a Spotify playlist link -- it was not saved.";
+    } else {
+        spotify_note_.clear();
+        spotify_playlist_ = uri;
+        ctx_.settings.spotify_playlist_uri = uri;
+    }
+}
+
 void SettingsScreen::save() {
     ctx_.settings.ollama_model = (ollama_model_selected_ >= 0 && ollama_model_selected_ < static_cast<int>(ollama_models_.size()))
                                       ? ollama_models_[ollama_model_selected_]
                                       : "";
+    ctx_.settings.llm_backend = llm_backend_index_ == 1 ? "llamacpp" : "ollama";
+    ctx_.settings.llamacpp_host = llamacpp_host_.empty() ? kLlamaCppHostDefault : llamacpp_host_;
+    if (llm_backend_index_ == 1) ctx_.set_llamacpp_api_key(llamacpp_api_key_);
     ctx_.settings.whisper_model_size = whisper_sizes_[whisper_size_selected_];
     ctx_.settings.detect_speaker_turns = detect_speaker_turns_;
     ctx_.settings.diarize_far_end = diarize_far_end_;
@@ -297,6 +401,8 @@ void SettingsScreen::save() {
     ctx_.settings.reminder_time = reminder_time_.empty() ? "09:00" : reminder_time_;
     ctx_.settings.reminder_enabled = reminder_enabled_;
     ctx_.settings.echo_cancel = echo_cancel_;
+    apply_focus_and_spotify_fields();
+
     // Blank means "use the built-in wording" rather than "ask for nothing".
     ctx_.settings.summary_prompt = summary_prompt_.empty() ? kDefaultSummaryPrompt : summary_prompt_;
     ctx_.settings.email_prompt = email_prompt_.empty() ? kDefaultEmailPrompt : email_prompt_;
@@ -308,37 +414,63 @@ void SettingsScreen::save() {
     ctx_.reminder->set_enabled(ctx_.settings.reminder_enabled);
 
     std::lock_guard<std::mutex> lock(status_mutex_);
-    ollama_status_ =
-        "Settings saved." + std::string(db_path_changed ? " Restart CallScribe for the new database path." : "") +
-        " Whisper model reloading in background.";
+    save_status_ = "Saved at " + util::now_time_hhmm() + "." +
+                   std::string(db_path_changed ? " Restart CallScribe for the new database path." : "") +
+                   " Whisper model reloading in the background.";
 }
 
 void SettingsScreen::build_ui() {
     using namespace ftxui;
 
+    MenuOption backend_opt = MenuOption::Horizontal();
+    backend_opt.on_change = [this] {
+        // Applied straight away rather than on Save: the sections below are
+        // about the server picked here, so they should talk to it.
+        if (llm_backend_index_ == 1) {
+            check_llamacpp();
+        } else {
+            ctx_.settings.llm_backend = "ollama";
+            ctx_.save_settings();
+            refresh_models();
+        }
+    };
+    auto backend_toggle = Menu(&llm_backends_, &llm_backend_index_, backend_opt);
+    InputOption llama_host_opt = styled_input_option();
+    llama_host_opt.multiline = false;
+    llama_host_opt.on_enter = [this] { check_llamacpp(); };
+    auto llama_host_input = WrappedInput(&llamacpp_host_, kLlamaCppHostDefault, llama_host_opt);
+    InputOption api_key_opt = styled_input_option();
+    api_key_opt.multiline = false;
+    api_key_opt.password = true;
+    api_key_opt.on_enter = [this] { check_llamacpp(); };
+    auto llama_key_input = WrappedInput(&llamacpp_api_key_, "only if started with --api-key", api_key_opt);
+    auto llama_check_btn = Button("Check", [this] { check_llamacpp(); }, button_style(theme::kAccent));
+
     auto model_dropdown = Dropdown(&ollama_models_, &ollama_model_selected_);
-    auto refresh_models_btn = Button("Refresh", [this] { refresh_models(); });
-    auto pull_btn = Button(std::string("Pull ") + kRecommendedOllamaModel, [this] { pull_recommended(); });
+    auto refresh_models_btn = Button("Refresh", [this] { refresh_models(); }, button_style(theme::kMuted));
+    auto pull_btn = Button(std::string("Pull ") + kRecommendedOllamaModel, [this] { pull_recommended(); },
+                           button_style(theme::kMuted));
 
     InputOption keep_alive_opt = styled_input_option();
     keep_alive_opt.multiline = false;
     auto keep_alive_input = WrappedInput(&ollama_keep_alive_, kDefaultOllamaKeepAlive, keep_alive_opt);
-    auto unload_btn = Button("Unload now", [this] { unload_now(); });
+    auto unload_btn = Button("Unload now", [this] { unload_now(); }, button_style(theme::kMuted));
     auto unload_after_use_checkbox =
         Checkbox("Unload the model as soon as each summary or reply is done", &ollama_unload_after_use_);
 
     auto whisper_size_dropdown = Dropdown(&whisper_sizes_, &whisper_size_selected_);
-    auto download_model_btn = Button("Download model", [this] { download_model(); });
+    auto download_model_btn = Button("Download model", [this] { download_model(); }, button_style(theme::kAccent));
     auto speaker_turns_checkbox =
         Checkbox("Split the far end into speaker turns (tinydiarize)", &detect_speaker_turns_);
     auto diarize_checkbox =
         Checkbox("Identify far-end speakers after the call (recommended)", &diarize_far_end_);
     auto download_diarization_btn =
-        Button("Download speaker models", [this] { download_diarization_models(); });
+        Button("Download speaker models", [this] { download_diarization_models(); },
+               button_style(theme::kAccent));
 
     auto mic_dropdown = Dropdown(&mic_labels_, &mic_selected_);
     auto monitor_dropdown = Dropdown(&monitor_labels_, &monitor_selected_);
-    auto refresh_devices_btn = Button("Refresh audio devices", [this] { refresh_audio_devices(); });
+    auto refresh_devices_btn = Button("Refresh audio devices", [this] { refresh_audio_devices(); }, button_style(theme::kMuted));
     auto test_mic_btn = Button(
         "Test Mic",
         [this] {
@@ -347,7 +479,7 @@ void SettingsScreen::build_ui() {
             else
                 start_mic_test();
         },
-        ButtonOption::Animated(theme::kAccent));
+        button_style(theme::kAccent));
     auto test_speaker_btn = Button(
         "Test Speaker",
         [this] {
@@ -356,7 +488,7 @@ void SettingsScreen::build_ui() {
             else
                 start_monitor_test();
         },
-        ButtonOption::Animated(theme::kAccent));
+        button_style(theme::kAccent));
 
     InputOption name_opt = styled_input_option();
     name_opt.multiline = false;
@@ -372,6 +504,39 @@ void SettingsScreen::build_ui() {
     time_opt.multiline = false;
     auto time_input = WrappedInput(&reminder_time_, "HH:MM", time_opt);
 
+    InputOption minutes_opt = styled_input_option();
+    minutes_opt.multiline = false;
+    auto focus_minutes_input = WrappedInput(&focus_minutes_, "25", minutes_opt);
+    auto short_break_input = WrappedInput(&short_break_minutes_, "5", minutes_opt);
+    auto long_break_input = WrappedInput(&long_break_minutes_, "15", minutes_opt);
+    auto hyperfocus_input = WrappedInput(&hyperfocus_minutes_, "90", minutes_opt);
+    auto meeting_minutes_input = WrappedInput(&meeting_reminder_minutes_, "15", minutes_opt);
+    auto eod_checkbox = Checkbox("Remind me to log the day (skipped once it's saved)", &end_of_day_enabled_);
+    auto eod_time_input = WrappedInput(&end_of_day_time_, "17:30", minutes_opt);
+
+    InputOption spotify_opt = styled_input_option();
+    spotify_opt.multiline = false;
+    auto spotify_client_input = WrappedInput(&spotify_client_id_, "Client ID from developer.spotify.com", spotify_opt);
+    auto spotify_port_input = WrappedInput(&spotify_port_, "8888", spotify_opt);
+    auto spotify_playlist_input =
+        WrappedInput(&spotify_playlist_, "spotify:playlist:... or an open.spotify.com link", spotify_opt);
+    auto spotify_connect_btn = Button(
+        "Connect",
+        [this] {
+            // Saved first, so the login uses what's in the fields right now.
+            apply_focus_and_spotify_fields();
+            ctx_.save_settings();
+            if (ctx_.settings.spotify_client_id.empty())
+                spotify_note_ = "Enter your Spotify app's Client ID first.";
+            else
+                ctx_.spotify->connect();
+        },
+        button_style(theme::kSuccess));
+    auto spotify_cancel_btn = Button("Cancel login", [this] { ctx_.spotify->cancel_login(); },
+                                     button_style(theme::kMuted));
+    auto spotify_disconnect_btn =
+        Button("Disconnect", [this] { ctx_.spotify->disconnect(); }, button_style(theme::kMuted));
+
     // Prompt presets. Multiline so a longer instruction stays readable, and
     // wrapped in their own box below the rest of the settings.
     InputOption prompt_opt;
@@ -383,14 +548,22 @@ void SettingsScreen::build_ui() {
         summary_prompt_ = kDefaultSummaryPrompt;
         email_prompt_ = kDefaultEmailPrompt;
         tasks_prompt_ = kDefaultTasksPrompt;
-    });
+    }, button_style(theme::kMuted));
 
-    auto save_btn = Button("Save Settings", [this] { save(); }, ButtonOption::Animated(theme::kAccent));
+    auto save_btn = Button("Save Settings", [this] { save(); }, button_style(theme::kAccent));
 
-    auto layout = Container::Vertical({
+    auto ollama_section = Container::Vertical({
         Container::Horizontal({model_dropdown, refresh_models_btn, pull_btn}),
         Container::Horizontal({keep_alive_input, unload_btn}),
         unload_after_use_checkbox,
+    });
+    auto llama_section =
+        Container::Vertical({Container::Horizontal({llama_host_input, llama_check_btn}), llama_key_input});
+
+    auto layout = Container::Vertical({
+        backend_toggle,
+        Maybe(ollama_section, [this] { return llm_backend_index_ == 0; }),
+        Maybe(llama_section, [this] { return llm_backend_index_ == 1; }),
         // Maybe, so a button that isn't drawn (already installed, or a
         // download in flight) also stops being a Tab stop.
         Container::Horizontal({whisper_size_dropdown, Maybe(download_model_btn, [this] {
@@ -408,21 +581,38 @@ void SettingsScreen::build_ui() {
         name_input,
         db_input,
         Container::Horizontal({reminder_checkbox, time_input}),
+        meeting_minutes_input,
         echo_cancel_checkbox,
+        Container::Horizontal({focus_minutes_input, short_break_input, long_break_input}),
+        hyperfocus_input,
+        Container::Horizontal({eod_checkbox, eod_time_input}),
+        spotify_client_input,
+        spotify_port_input,
+        spotify_playlist_input,
+        // Only what is drawn is a Tab stop: Cancel while a login is waiting,
+        // Connect/Disconnect otherwise.
+        Container::Horizontal({
+            Maybe(spotify_connect_btn, [this] { return !ctx_.spotify->logging_in(); }),
+            Maybe(spotify_cancel_btn, [this] { return ctx_.spotify->logging_in(); }),
+            Maybe(spotify_disconnect_btn,
+                  [this] { return !ctx_.spotify->logging_in() && ctx_.spotify->connected(); }),
+        }),
         summary_prompt_input,
         email_prompt_input,
         tasks_prompt_input,
         reset_prompts_btn,
-        save_btn,
     });
 
-    root_ = Renderer(layout, [this, model_dropdown, refresh_models_btn, pull_btn, keep_alive_input, unload_btn,
-                              unload_after_use_checkbox,
+    root_ = Renderer(layout, [this, backend_toggle, llama_host_input, llama_key_input, llama_check_btn, model_dropdown,
+                              refresh_models_btn, pull_btn, keep_alive_input, unload_btn, unload_after_use_checkbox,
                                whisper_size_dropdown,
                                download_model_btn, speaker_turns_checkbox, diarize_checkbox,
                                download_diarization_btn, mic_dropdown, monitor_dropdown, refresh_devices_btn, test_mic_btn,
                                test_speaker_btn, name_input, db_input, reminder_checkbox, time_input, echo_cancel_checkbox,
-                               summary_prompt_input, email_prompt_input, tasks_prompt_input, reset_prompts_btn,
+                               focus_minutes_input, short_break_input, long_break_input, hyperfocus_input,
+                               eod_checkbox, eod_time_input, meeting_minutes_input, spotify_client_input,
+                               spotify_port_input, spotify_playlist_input, spotify_connect_btn, spotify_cancel_btn,
+                               spotify_disconnect_btn, summary_prompt_input, email_prompt_input, tasks_prompt_input, reset_prompts_btn,
                                save_btn] {
         if (models_need_refresh_.exchange(false)) refresh_models();
 
@@ -455,30 +645,54 @@ void SettingsScreen::build_ui() {
             transcription::cuda_build_available() ? "CUDA build detected" : "No CUDA in this build (CPU)";
 
         Elements children;
-        children.push_back(text("CallScribe -- Settings") | bold | color(theme::kAccent));
-        children.push_back(separator() | color(theme::kMuted));
+        // Grouped into titled sections as the page is built: begin_section()
+        // closes the one in progress and starts the next.
+        Elements page;
+        std::string section_title;
+        auto begin_section = [&](std::string title) {
+            if (!children.empty()) page.push_back(section(section_title, vbox(std::move(children))));
+            children.clear();
+            section_title = std::move(title);
+        };
+        begin_section("AI");
 
-        children.push_back(text("Ollama model:") | bold | color(theme::kAccent));
-        children.push_back(hbox({
-            model_dropdown->Render() | flex,
-            text(" "),
-            refresh_models_btn->Render(),
-            text(" "),
-            pull_btn->Render(),
-        }));
-        if (!ollama_status_copy.empty()) children.push_back(text(ollama_status_copy) | dim);
-        if (pulling_now || !pull_status_copy.empty()) children.push_back(text(pull_status_copy) | dim);
+        children.push_back(hbox({text("Server  ") | color(Color::GrayLight), backend_toggle->Render()}));
+        if (llm_backend_index_ == 1) {
+            children.push_back(field_row("Server URL", hbox({llama_host_input->Render() | flex, text(" "),
+                                                            llama_check_btn->Render()})));
+            children.push_back(field_row("API key", llama_key_input->Render()));
+            children.push_back(text("  Kept in your desktop keyring, not in the config file.") | dim);
+            if (!llamacpp_status_.empty())
+                children.push_back(paragraph("  " + llamacpp_status_) |
+                                   color(llamacpp_status_.rfind("Connected", 0) == 0 ? theme::kSuccess
+                                                                                     : theme::kWarning));
+            children.push_back(text("  Uses the model llama-server was started with (-m) and its context size") | dim);
+            children.push_back(text("  (-c). Long calls are split to fit that context automatically.") | dim);
+        }
+        if (llm_backend_index_ == 0) {
+            children.push_back(text("Ollama model") | color(Color::GrayLight));
+            children.push_back(hbox({
+                model_dropdown->Render() | flex,
+                text(" "),
+                refresh_models_btn->Render(),
+                text(" "),
+                pull_btn->Render(),
+            }));
+            if (!ollama_status_copy.empty()) children.push_back(text(ollama_status_copy) | dim);
+            if (pulling_now || !pull_status_copy.empty()) children.push_back(text(pull_status_copy) | dim);
 
-        children.push_back(hbox({text("Keep model loaded for: "), keep_alive_input->Render() | size(WIDTH, EQUAL, 10),
-                                  text(" "), unload_btn->Render()}));
-        children.push_back(text("  How long Ollama holds the model in memory after a call (10m, 1h, 0, -1).") | dim);
-        children.push_back(text("  Shorter frees VRAM for Whisper, which otherwise transcribes on CPU.") | dim);
-        children.push_back(unload_after_use_checkbox->Render());
-        children.push_back(text("  On: the model is loaded for the job and dropped straight after, so it never") | dim);
-        children.push_back(text("  sits alongside Whisper or another Ollama client. Costs a reload each time.") | dim);
+            children.push_back(hbox({text("Keep loaded for ") | color(Color::GrayLight) | vcenter,
+                                     keep_alive_input->Render() | size(WIDTH, EQUAL, 10), text(" "),
+                                     unload_btn->Render()}));
+            children.push_back(text("  How long Ollama holds the model in memory after a call (10m, 1h, 0, -1).") | dim);
+            children.push_back(text("  Shorter frees VRAM for Whisper, which otherwise transcribes on CPU.") | dim);
+            children.push_back(unload_after_use_checkbox->Render());
+            children.push_back(text("  On: the model is loaded for the job and dropped straight after, so it never") | dim);
+            children.push_back(text("  sits alongside Whisper or another Ollama client. Costs a reload each time.") | dim);
+        }
 
-        children.push_back(separator() | color(theme::kMuted));
-        children.push_back(text("Whisper model size (" + cuda_note + "):") | bold | color(theme::kAccent));
+        begin_section("Transcription -- " + cuda_note);
+        children.push_back(text("Whisper model size") | color(Color::GrayLight));
         Elements whisper_row = {whisper_size_dropdown->Render(), text(" ")};
         if (downloading_now)
             whisper_row.push_back(text(" Downloading... ") | color(theme::kWarning));
@@ -494,8 +708,7 @@ void SettingsScreen::build_ui() {
         // Diarization first: it is the better answer for "who said that", works
         // with any Whisper model, and the tinydiarize option below is the
         // fallback for wanting it live rather than after the call.
-        children.push_back(separator() | color(theme::kMuted));
-        children.push_back(text("Speaker identification (far end):") | bold | color(theme::kAccent));
+        begin_section("Speaker identification (far end)");
         Elements diarize_row = {diarize_checkbox->Render(), text("  ")};
         if (downloading_diarization_now)
             diarize_row.push_back(text(" Downloading... ") | color(theme::kWarning));
@@ -518,7 +731,7 @@ void SettingsScreen::build_ui() {
                                 color(theme::kWarning));
         if (!diarization_status_copy.empty()) children.push_back(text("  " + diarization_status_copy) | dim);
 
-        children.push_back(separator() | color(theme::kMuted));
+        children.push_back(text(""));
         children.push_back(speaker_turns_checkbox->Render());
         // Said plainly, because the feature is easy to over-read: it marks that
         // the voice changed, and the participant list supplies names in the
@@ -534,10 +747,9 @@ void SettingsScreen::build_ui() {
             children.push_back(text("  than medium/large. Your own mic is a separate stream either way.") | dim);
         }
 
-        children.push_back(separator() | color(theme::kMuted));
-        children.push_back(text("Audio sources:") | bold | color(theme::kAccent));
-        children.push_back(hbox({text("Mic:     "), mic_dropdown->Render() | flex}));
-        children.push_back(hbox({text("Monitor: "), monitor_dropdown->Render() | flex}));
+        begin_section("Audio");
+        children.push_back(field_row("Mic", mic_dropdown->Render()));
+        children.push_back(field_row("Speakers", monitor_dropdown->Render()));
         children.push_back(hbox({refresh_devices_btn->Render(), text(" "), test_mic_btn->Render(), text(" "),
                                   test_speaker_btn->Render()}));
 
@@ -551,18 +763,86 @@ void SettingsScreen::build_ui() {
                                 flex);
         }
 
-        children.push_back(separator() | color(theme::kMuted));
-        children.push_back(hbox({text("Your name (labels your side of the call): "), name_input->Render() | flex}));
-        children.push_back(hbox({text("Database file: "), db_input->Render() | flex}));
-        children.push_back(hbox({reminder_checkbox->Render(), text("   Time: "),
-                                  time_input->Render() | size(WIDTH, EQUAL, 8)}));
+        begin_section("You");
+        children.push_back(field_row("Your name", name_input->Render()));
+        children.push_back(field_row("Database file", db_input->Render()));
+        children.push_back(hbox({reminder_checkbox->Render() | vcenter, text("   at ") | dim | vcenter,
+                                 time_input->Render() | size(WIDTH, EQUAL, 9), filler()}));
+        children.push_back(hbox({text("Meeting reminder ") | color(Color::GrayLight) | vcenter,
+                                 meeting_minutes_input->Render() | size(WIDTH, EQUAL, 7),
+                                 text(" min before each call on your calendar  (0 = off)") | dim | vcenter,
+                                 filler()}));
 
         children.push_back(echo_cancel_checkbox->Render());
         children.push_back(text("  While recording, audio is routed through a CallScribe device so the") | dim);
         children.push_back(text("  mic can be cleaned. Your normal output is restored when it stops.") | dim);
 
-        children.push_back(separator() | color(theme::kMuted));
-        children.push_back(text("AI prompts") | bold | color(theme::kAccent));
+        begin_section("Focus");
+        // A label column, a small box, and its unit after it -- each row
+        // centred on the three-row box so the text sits level with the value.
+        auto label = [](const std::string& t, int width) {
+            return text(t) | color(Color::GrayLight) | size(WIDTH, EQUAL, width) | vcenter;
+        };
+        auto unit = [](const std::string& t) { return text(t) | dim | vcenter; };
+        children.push_back(hbox({
+            label("Focus round", 16), focus_minutes_input->Render() | size(WIDTH, EQUAL, 7), unit(" min"),
+            text("     "),
+            label("Short break", 13), short_break_input->Render() | size(WIDTH, EQUAL, 7), unit(" min"),
+            text("     "),
+            label("Long break", 12), long_break_input->Render() | size(WIDTH, EQUAL, 7), unit(" min"),
+            filler(),
+        }));
+        children.push_back(hbox({text("") | size(WIDTH, EQUAL, 16),
+                                 text("The long break comes after every " +
+                                      std::to_string(focus::kRoundsBeforeLongBreak) + " focus rounds.") |
+                                     dim}));
+        children.push_back(hbox({
+            label("Check-in after", 16), hyperfocus_input->Render() | size(WIDTH, EQUAL, 7),
+            unit(" min of focus or calls with no 5-minute break  (0 = off)"), filler(),
+        }));
+        children.push_back(hbox({
+            label("Wrap-up at", 16), eod_time_input->Render() | size(WIDTH, EQUAL, 9), text("  "),
+            eod_checkbox->Render() | vcenter, filler(),
+        }));
+
+        begin_section("Spotify (optional)");
+        children.push_back(text("  Plays a playlist during focus rounds and pauses it for breaks. Needs Premium.") |
+                           dim);
+        children.push_back(text("  Create an app at developer.spotify.com/dashboard (Web API), add this exact") | dim);
+        children.push_back(text("  Redirect URI to it, and paste its Client ID below:") | dim);
+        children.push_back(text("    " + spotify::redirect_uri(parse_int(spotify_port_, 8888))) |
+                           color(theme::kWarning));
+        children.push_back(field_row("Client ID", spotify_client_input->Render()));
+        children.push_back(field_row("Redirect port", hbox({spotify_port_input->Render() | size(WIDTH, EQUAL, 9), filler()})));
+        children.push_back(field_row("Focus playlist", spotify_playlist_input->Render()));
+
+        const bool logging_in = ctx_.spotify->logging_in();
+        const bool spotify_connected = ctx_.spotify->connected();
+        Elements spotify_row;
+        if (logging_in) {
+            spotify_row.push_back(spotify_cancel_btn->Render());
+        } else {
+            spotify_row.push_back(spotify_connect_btn->Render());
+            if (spotify_connected) {
+                spotify_row.push_back(text(" "));
+                spotify_row.push_back(spotify_disconnect_btn->Render());
+            }
+        }
+        spotify_row.push_back(text("  "));
+        spotify_row.push_back((spotify_connected ? text(" ✓ Connected ") | color(theme::kSuccess)
+                                                 : text(" Not connected ") | color(theme::kMuted)) |
+                              vcenter);
+        children.push_back(hbox(std::move(spotify_row)));
+        std::string spotify_status = ctx_.spotify->status();
+        if (!spotify_note_.empty()) children.push_back(paragraph("  " + spotify_note_) | color(theme::kWarning));
+        if (!spotify_status.empty()) children.push_back(paragraph("  " + spotify_status) | dim);
+        std::string manual_url = ctx_.spotify->manual_login_url();
+        if (!manual_url.empty()) children.push_back(paragraph(manual_url) | color(theme::kAccent));
+        children.push_back(text("  The login token is kept in your desktop keyring (KWallet / GNOME Keyring),") |
+                           dim);
+        children.push_back(text("  never in a file.") | dim);
+
+        begin_section("AI prompts");
         children.push_back(text("What to ask the model for. The reply format is fixed; this is the wording.") | dim);
         children.push_back(text("Summary:"));
         children.push_back(summary_prompt_input->Render() | size(HEIGHT, LESS_THAN, 4) |
@@ -575,10 +855,26 @@ void SettingsScreen::build_ui() {
                             borderStyled(ROUNDED, theme::kMuted));
         children.push_back(reset_prompts_btn->Render());
 
-        children.push_back(separator() | color(theme::kMuted));
-        children.push_back(save_btn->Render());
+        begin_section("");
+        return vbox(std::move(page));
+    });
+    // The page is far taller than a terminal, and without this only moving
+    // focus through it from the keyboard ever brought the lower half on screen.
+    root_ = ScrollableForm(root_);
 
-        return vbox(children) | flex | frame;
+    // Save sits in a footer outside the scrolling page, so it's always one
+    // click away however far down the change was.
+    auto form = root_;
+    root_ = Renderer(Container::Vertical({form, save_btn}), [this, form, save_btn] {
+        std::string note;
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            note = save_status_;
+        }
+        return vbox({
+            form->Render() | flex,
+            hbox({text(" " + note) | dim | vcenter, filler(), save_btn->Render()}),
+        });
     });
 }
 

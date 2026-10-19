@@ -221,6 +221,7 @@ std::vector<ExtractedTask> parse_task_items(const nlohmann::json& node, const st
         ExtractedTask task;
         task.description = field(obj, {"description", "task", "action", "item", "title", "what"});
         task.due_date = field(obj, {"due_date", "due", "date", "deadline"});
+        task.due_said = field(obj, {"due_said", "deadline_said", "when_said"});
         task.priority = field(obj, {"priority", "urgency", "importance"});
         task.customer = field(obj, {"customer", "client", "account", "company"});
         if (task.description.empty()) return;
@@ -266,7 +267,10 @@ std::vector<ExtractedTask> parse_task_items(const nlohmann::json& node, const st
     for (auto& task : raw) {
         task.description = strip_bullet(task.description);
         if (task.description.empty()) continue;
-        task.due_date = util::normalize_due_date(task.due_date, base_date);
+        // The spoken phrase wins when it names a day: the model's own ISO date
+        // for "by Friday" is the part it most often gets wrong.
+        const std::string spoken = util::resolve_spoken_deadline(task.due_said, base_date);
+        task.due_date = spoken.empty() ? util::normalize_due_date(task.due_date, base_date) : spoken;
         task.priority = db::normalize_priority(task.priority);
         if (to_lower(task.customer).find("not specified") != std::string::npos || task.customer == "-" ||
             to_lower(task.customer) == "n/a" || to_lower(task.customer) == "unknown")
@@ -281,7 +285,7 @@ CallSummaryResult summarize_call(const std::string& host, const std::string& mod
                                   const std::string& customer_name, const std::string& meeting_name,
                                   const std::string& participants, const std::string& call_date,
                                   const std::function<void(const std::string&)>& on_progress,
-                                  const PromptPresets& prompts) {
+                                  const PromptPresets& prompts, const std::string& user_name) {
     // One session for the whole map/reduce chain below: the model stays loaded
     // between the chunk calls and the final summary, then goes away.
     ModelSession session(host, model);
@@ -292,7 +296,7 @@ CallSummaryResult summarize_call(const std::string& host, const std::string& mod
 
     if (on_progress) on_progress("Summarizing...");
     std::string prompt = build_summary_prompt(body, customer_name, meeting_name, participants, call_date,
-                                               prompts.summary, prompts.email, prompts.tasks);
+                                               prompts.summary, prompts.email, prompts.tasks, user_name);
     nlohmann::json data = generate_json(host, model, prompt);
 
     std::vector<std::string> bullets;
@@ -339,13 +343,147 @@ std::string generate_yearly_narrative(const std::string& host, const std::string
     return generate_text(host, model, prompt);
 }
 
-std::string generate_review_report(const std::string& host, const std::string& model, int year,
+ReviewMaterial collect_review_material(db::Repository& repo, int year) {
+    const std::string from = std::to_string(year) + "-01-01";
+    const std::string to = std::to_string(year + 1) + "-01-01";
+
+    ReviewMaterial m;
+    db::YearlyStats stats = repo.yearly_stats(year);
+    m.facts.period = std::to_string(year);
+    m.facts.call_count = stats.call_count;
+    m.facts.call_seconds = stats.total_seconds;
+    m.facts.tasks_completed = stats.tasks_completed;
+    m.facts.top_customers = stats.top_customers;
+    m.facts.focus_seconds_by_tag = repo.focus_seconds_by_tag(from, to);
+
+    for (const auto& c : repo.list_call_notes(from, to)) {
+        std::string who = c.customer_name;
+        if (!c.meeting_name.empty()) who += (who.empty() ? "" : " -- ") + c.meeting_name;
+        m.evidence.push_back({c.started_at, "Call", (who.empty() ? "" : who + ": ") + c.summary, false});
+    }
+    for (const auto& t : repo.list_completed_tasks(from, to)) {
+        std::string text = t.description;
+        if (!t.customer_name.empty()) text += " (" + t.customer_name + ")";
+        m.evidence.push_back({t.completed_at, "Task done", text, false});
+    }
+    auto wins = repo.list_wins(from, to);
+    m.facts.wins = static_cast<int>(wins.size());
+    for (const auto& w : wins)
+        m.evidence.push_back({w.created_at, "Win", (w.tag.empty() ? "" : "[" + w.tag + "] ") + w.text, true});
+    // Only rounds with something written down -- a bare "25 minutes on
+    // Indica" says nothing the focus totals above don't.
+    for (const auto& f : repo.list_focus_sessions_between(from, to)) {
+        if (f.next_step.empty() && f.progress_note.empty()) continue;
+        std::string text = f.tag + ", " + std::to_string((f.duration_seconds + 30) / 60) + " min";
+        if (!f.next_step.empty()) text += "; aimed to: " + f.next_step;
+        if (!f.progress_note.empty()) text += "; got to: " + f.progress_note;
+        m.evidence.push_back({f.started_at, "Focus", text, false});
+    }
+    for (const auto& d : repo.list_daily_logs(from, to)) {
+        if (!d.note.empty()) m.evidence.push_back({d.day, "Day", d.note, true});
+    }
+    return m;
+}
+
+std::vector<std::string> split_questions(const std::string& text) {
+    std::vector<std::string> blocks;
+    std::string current;
+    std::istringstream in(text);
+    std::string line;
+    auto flush = [&] {
+        if (!trim(current).empty()) blocks.push_back(trim(current));
+        current.clear();
+    };
+    while (std::getline(in, line)) {
+        if (trim(line).empty()) {
+            flush();
+        } else {
+            if (!current.empty()) current += "\n";
+            current += line;
+        }
+    }
+    flush();
+
+    // One block of several lines that each end in '?' is a list of questions
+    // pasted without gaps, not one long question.
+    if (blocks.size() == 1 && blocks[0].find('\n') != std::string::npos) {
+        std::vector<std::string> lines;
+        std::istringstream block(blocks[0]);
+        bool all_questions = true;
+        while (std::getline(block, line)) {
+            std::string t = trim(line);
+            if (t.empty()) continue;
+            if (t.back() != '?') all_questions = false;
+            lines.push_back(t);
+        }
+        if (all_questions) return lines;
+    }
+    return blocks;
+}
+
+ReviewReport generate_review_report(const std::string& host, const std::string& model, const std::string& user_name,
                                     const std::string& cycle_label, const std::vector<std::string>& questions,
-                                    const db::YearlyStats& stats) {
-    std::string prompt = build_review_report_prompt(year, cycle_label, questions, stats.summaries, stats.call_count,
-                                                     stats.total_seconds, stats.tasks_completed, stats.top_customers);
+                                    const ReviewFacts& facts, std::vector<EvidenceItem> evidence) {
+    ReviewReport report;
+    report.evidence_total = evidence.size();
+
+    // Everything but the evidence, to see what's left of the context for it.
+    // A fifth is held back on top: reasoning models spend part of the output
+    // budget thinking before they answer.
+    const std::string frame = build_review_report_prompt(user_name, cycle_label, questions, facts, {}, 0);
+    const long available = max_prompt_chars() * 4 / 5 - static_cast<long>(frame.size());
+    std::string query;
+    for (const auto& q : questions) query += q + "\n";
+    auto chosen = select_evidence(std::move(evidence), query, static_cast<size_t>(std::max(0L, available)));
+    report.evidence_used = chosen.size();
+
+    const std::string prompt =
+        build_review_report_prompt(user_name, cycle_label, questions, facts, chosen, report.evidence_total);
     ModelSession session(host, model);
-    return generate_text(host, model, prompt);
+    report.text = generate_text(host, model, prompt);
+    return report;
+}
+
+std::vector<std::string> parse_steps(const nlohmann::json& reply) {
+    nlohmann::json node = reply;
+    if (node.is_object()) {
+        for (const char* key : {"steps", "Steps", "tasks", "items"}) {
+            if (node.contains(key)) {
+                node = node[key];
+                break;
+            }
+        }
+    }
+    std::vector<std::string> out;
+    auto add = [&out](std::string text) {
+        text = strip_bullet(text);
+        if (!text.empty()) out.push_back(text);
+    };
+    if (node.is_array()) {
+        for (const auto& item : node) {
+            if (item.is_string()) {
+                add(item.get<std::string>());
+            } else if (item.is_object()) {
+                for (const char* key : {"step", "description", "title", "text"}) {
+                    if (item.contains(key) && item[key].is_string()) {
+                        add(item[key].get<std::string>());
+                        break;
+                    }
+                }
+            }
+        }
+    } else if (node.is_string()) {
+        std::istringstream in(node.get<std::string>());
+        std::string line;
+        while (std::getline(in, line)) add(line);
+    }
+    return out;
+}
+
+std::vector<std::string> break_down_task(const std::string& host, const std::string& model, const std::string& task,
+                                         const std::string& customer, const std::string& due_date) {
+    ModelSession session(host, model);
+    return parse_steps(generate_json(host, model, build_task_breakdown_prompt(task, customer, due_date)));
 }
 
 ChatReply proofread_email(const std::string& host, const std::string& model, const std::string& email_text,

@@ -12,6 +12,26 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// Which server the LLM calls go to. Every function in this header takes a
+// host and model either way; the backend decides what is said to them.
+//
+// LlamaCpp is llama.cpp's `llama-server`, spoken to through its
+// OpenAI-compatible /v1/chat/completions. It loads one model when it starts and
+// keeps it, so there is nothing to pull or unload and keep_alive does not apply;
+// the context window is whatever -c the server was started with, read from
+// /props (see refresh_server_context).
+enum class Backend { Ollama, LlamaCpp };
+void set_backend(Backend backend);
+Backend backend();
+// llama-server's --api-key, sent as a Bearer token. Empty = none. Never sent
+// to Ollama, which has no such thing.
+void set_api_key(const std::string& key);
+
+// Asks a llama.cpp server for its context size so prompts are budgeted to fit
+// it. Best-effort: on failure the Ollama-sized default stays in force. Returns
+// the size in tokens, or 0 if it couldn't be read.
+long refresh_server_context(const std::string& host);
+
 // Sets the `keep_alive` sent with every subsequent chat request -- how long
 // Ollama holds the model in (V)RAM once the reply is done. Set once at startup
 // and again whenever Settings is saved, rather than being threaded through
@@ -53,6 +73,7 @@ private:
 };
 
 bool is_running(const std::string& host);
+// Ollama: everything installed. llama.cpp: the model(s) the server has loaded.
 std::vector<std::string> list_models(const std::string& host);
 
 // Asks Ollama to drop `model` from memory right now (keep_alive: 0), freeing

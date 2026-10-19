@@ -54,6 +54,12 @@ void ReminderScheduler::set_enabled(bool enabled) {
     enabled_ = enabled;
 }
 
+void ReminderScheduler::set_end_of_day(const std::string& time, bool enabled) {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    end_of_day_time_ = time;
+    end_of_day_enabled_ = enabled;
+}
+
 void ReminderScheduler::set_on_fired(Callback cb) {
     std::lock_guard<std::mutex> lock(callback_mutex_);
     on_fired_ = std::move(cb);
@@ -67,16 +73,25 @@ void ReminderScheduler::loop() {
         if (++elapsed_seconds < 60) continue;
         elapsed_seconds = 0;
 
-        bool enabled;
-        std::string reminder_time;
+        bool enabled, eod_enabled;
+        std::string reminder_time, eod_time;
         {
             std::lock_guard<std::mutex> lock(config_mutex_);
             enabled = enabled_;
             reminder_time = reminder_time_;
+            eod_enabled = end_of_day_enabled_;
+            eod_time = end_of_day_time_;
         }
-        if (!enabled) continue;
-
         std::string today = util::today_iso();
+
+        if (eod_enabled && today != last_end_of_day_date_ && util::now_time_hhmm() >= eod_time) {
+            last_end_of_day_date_ = today;
+            if (!repo_.get_daily_log(today))
+                send_notification("Wrap up your day",
+                                  "CallScribe's Today tab has what you did -- add a line while it's fresh.");
+        }
+
+        if (!enabled) continue;
         if (today == last_fired_date_) continue;
         if (util::now_time_hhmm() < reminder_time) continue;
 

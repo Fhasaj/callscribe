@@ -33,6 +33,17 @@ else
     missing=1
 fi
 
+for pc in libsecret-1 libcrypto; do
+    if pkg-config --exists "$pc" 2>/dev/null; then
+        echo "[ok] $pc dev headers found"
+    else
+        echo "[MISSING] $pc dev headers not found."
+        echo "          Fedora: sudo dnf install libsecret-devel openssl-devel"
+        echo "          Arch:   sudo pacman -S libsecret openssl"
+        missing=1
+    fi
+done
+
 if curl -sf --max-time 3 http://localhost:11434/api/tags >/dev/null 2>&1; then
     echo "[ok] Ollama is running on localhost:11434"
 else

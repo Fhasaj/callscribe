@@ -19,9 +19,16 @@ config (`~/.config/callscribe-cpp/`), separate database
 - CMake 3.21+, Ninja, a C++20 compiler (g++/clang)
 - `libcurl` dev headers (`libcurl-devel` on Fedora, `curl` on Arch --
   both ship the headers)
-- [Ollama](https://ollama.com) installed and running locally
+- [Ollama](https://ollama.com) installed and running locally -- or
+  llama.cpp's `llama-server` instead (Settings > AI > Server); its
+  `--api-key`, if any, goes in the desktop keyring
 - PipeWire with pulse compatibility (`pactl`/`parec`)
-- `notify-send` (libnotify) for desktop reminder popups (optional)
+- `libsecret` and OpenSSL dev headers (`libsecret-devel openssl-devel`
+  on Fedora; `libsecret openssl` on Arch) -- the Spotify login token is
+  kept in the desktop keyring (KWallet on Plasma, GNOME Keyring on
+  GNOME) via the Secret Service API
+- `notify-send` (libnotify) for desktop reminder and focus-timer popups
+  (optional)
 - A CUDA-capable GPU is optional -- detected automatically at CMake
   configure time (`find_package(CUDAToolkit)`); whisper.cpp is built
   with GPU support if found, CPU-only otherwise, no runtime switch
@@ -75,7 +82,8 @@ Go to the **Settings** screen and:
 - **History** -- search past calls, view transcript/summary/email,
   re-generate a summary.
 - **Tasks** -- manual + call-extracted tasks, checkable, with a daily
-  desktop notification for what's open.
+  desktop notification for what's open. `[steps]` on a task asks the
+  model for its first few concrete steps, which you tick to add.
 - **Calendar** -- your Teams/Outlook calendar, read-only, drawn as a
   real calendar: **Day** (hour-by-hour with a marker on the current
   hour), **Week** (seven columns from today), or **Month** (a
@@ -83,13 +91,61 @@ Go to the **Settings** screen and:
   switches any of them to a flat chronological list with organizer,
   location and join links. No Microsoft sign-in: see
   [Importing your calendar](#importing-your-calendar) below.
-- **Yearly Summary** -- stats for a chosen year plus an optional
-  LLM-written prose recap.
+- **Review** -- the year at a glance, and answers for your performance
+  review: paste the questions from the review form and the local model
+  writes first-person answers from your call notes, completed tasks,
+  wins, focus notes and daily notes -- the most relevant that fit its
+  context, citing real dates and customers, never invented numbers.
 - **Proofread** -- a small chat: paste or type an email, press Send,
   get a grammar/clarity-corrected version back as a reply, with copy
   support. Doesn't touch the call database -- just a quick local LLM
   utility.
-- **Settings** -- as above.
+- **Focus** -- a Pomodoro timer: focus (25 min), short break (5), and
+  a long break (15) after every fourth round; lengths are in Settings.
+  Starting a round asks for the project (Indica / Freelance / SkyPin /
+  Other) and the next step; finishing one asks where you got to, and
+  saves the lot -- tag, time actually focused, timestamps -- to the
+  log below the timer. Each change of phase pops a desktop
+  notification and rings the terminal bell, and the time left shows
+  on the tab from anywhere in the app. Keys: `s` start/pause, `k`
+  skip, `r` reset. Breaks start on their own; focus rounds wait for
+  you. "Just 5 min" starts a short round that asks whether to keep
+  going; thoughts parked with `^P` wait here for your break; after 90
+  minutes of focus or recording with no real break you get a check-in
+  (Settings); and "This week" totals time per project, with a
+  copyable timesheet.
+- **Today** -- what the day held (calls, tasks done, focus time, wins),
+  a line of your own about it, and your recent wins. Save it at the
+  end of the day -- a reminder comes at 17:30 -- and the review reads
+  it back.
+- **Anywhere** -- `^W` logs a win, `^P` parks a stray thought, and the
+  title bar shows what the current focus round is for.
+- **Settings** -- as above, plus the optional Spotify link (below).
+
+### Spotify (optional)
+
+With a Spotify account connected, a focus round starts your chosen
+playlist and a break pauses it. Without one, the timer works exactly
+the same. Playback control needs Spotify Premium.
+
+1. Create an app at <https://developer.spotify.com/dashboard> (Web
+   API) and add the Redirect URI `http://127.0.0.1:8888/callback`
+   (or another port -- it must match the one in Settings exactly).
+2. In **Settings > Spotify**, paste the app's Client ID and a playlist
+   (`spotify:playlist:...` or an `open.spotify.com/playlist/...` link),
+   then **Connect**. Your browser opens on Spotify's consent page; if it
+   can't be opened, the link is shown (and copied) to open by hand.
+3. Have Spotify open somewhere -- desktop app, phone, speaker. If
+   nothing is playing, CallScribe picks the first device it can see.
+
+Once connected, the Focus tab shows a mini player -- track, artist,
+device, progress -- with Prev / Play-Pause / Next buttons, or `b` /
+`p` / `n` from the keyboard. With nothing loaded, Play starts your
+focus playlist.
+
+The login is Authorization Code + PKCE, so there's no client secret.
+The refresh token goes into your desktop keyring through libsecret,
+never into a file; **Disconnect** removes it.
 
 Tab between screens with the top menu (arrow keys / mouse). Within a
 screen, Tab/Shift+Tab moves between fields; Enter/click activates
@@ -171,8 +227,13 @@ src/
                                   with an offline cache
   tasks/                       daily reminder scheduler (background
                                 thread + notify-send)
+  focus/                       Pomodoro state machine (clock-free, so
+                                it's unit-tested with fake time)
+  spotify/                     PKCE login with a loopback redirect
+                                listener, Web API playback on a worker
+                                thread, refresh token in the keyring
   ui/                           FTXUI screens: Record, History, Tasks,
-                                 Calendar, Yearly Summary, Proofread,
+                                 Calendar, Review, Chat, Focus, Today,
                                   Settings
   util/                          small helpers: blocking queue, clipboard
                                   (wl-copy/xclip/xsel), WAV writer,

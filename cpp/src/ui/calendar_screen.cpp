@@ -12,6 +12,7 @@
 #include "ui/styled_input.hpp"
 #include "ui/text_wrap.hpp"
 #include "ui/theme.hpp"
+#include "ui/widgets.hpp"
 #include "ui/wrapped_input.hpp"
 
 namespace callscribe::ui {
@@ -605,9 +606,9 @@ void CalendarScreen::build_ui() {
     mins_opt.multiline = false;
     auto mins_input = WrappedInput(&refresh_minutes_, "30", mins_opt);
 
-    auto save_btn = Button("Save & Import", [this] { save_source(); }, ButtonOption::Animated(theme::kAccent));
-    auto refresh_btn = Button("Refresh now", [this] { request_refresh(); }, ButtonOption::Animated(theme::kAccent));
-    auto setup_btn = Button("Setup", [this] { setup_expanded_ = !setup_expanded_; });
+    auto save_btn = Button("Save & Import", [this] { save_source(); }, button_style(theme::kAccent));
+    auto refresh_btn = Button("Refresh now", [this] { request_refresh(); }, button_style(theme::kAccent));
+    auto setup_btn = Button("Setup", [this] { setup_expanded_ = !setup_expanded_; }, button_style(theme::kMuted));
 
     MenuOption range_opt = MenuOption::HorizontalAnimated();
     range_opt.on_change = [this] {
@@ -666,7 +667,6 @@ void CalendarScreen::build_ui() {
         if (ctx_.repo->revision() != seen_revision_) refresh_recorded_calls();
 
         Elements children;
-        children.push_back(text("CallScribe -- Calendar") | bold | color(theme::kAccent));
 
         std::string status_copy, error_copy;
         bool cached_copy;
@@ -679,33 +679,34 @@ void CalendarScreen::build_ui() {
             fetched_copy = fetched_at_;
         }
 
-        Elements status_row = {text(status_copy)};
+        // Status sits in the toolbar, beside the button it's about.
+        Elements status_row = {text(status_copy) | dim};
         if (loading_.load()) {
-            status_row.push_back(text("   importing...") | color(theme::kAccent));
+            status_row.push_back(text("  importing...") | color(theme::kAccent));
         } else if (fetched_copy != 0) {
-            status_row.push_back(text("   updated " + relative_age(fetched_copy)) | dim);
+            status_row.push_back(text("  updated " + relative_age(fetched_copy)) | dim);
         }
-        if (cached_copy) status_row.push_back(text("   [showing cached copy]") | color(theme::kWarning));
-        children.push_back(hbox(status_row));
-        if (!error_copy.empty())
-            children.push_back(text(truncate(error_copy, 110)) | color(theme::kDanger));
-        children.push_back(separator() | color(theme::kMuted));
+        if (cached_copy) status_row.push_back(text("  cached copy") | color(theme::kWarning));
 
         children.push_back(hbox({
-            view_menu->Render(),
+            view_menu->Render() | vcenter,
             // A plain glyph rather than separator(), which would draw a box
             // rule and weld itself to the panel border underneath.
-            text("   ·   ") | color(theme::kMuted),
-            range_menu->Render(),
+            text("   ·   ") | color(theme::kMuted) | vcenter,
+            range_menu->Render() | vcenter,
             filler(),
+            hbox(std::move(status_row)) | vcenter,
+            text("  "),
             refresh_btn->Render(),
             text(" "),
             setup_btn->Render(),
         }));
+        if (!error_copy.empty())
+            children.push_back(text(truncate(error_copy, 110)) | color(theme::kDanger));
 
         if (setup_expanded_) {
             Elements setup;
-            setup.push_back(hbox({text("Source: "), source_dropdown->Render()}));
+            setup.push_back(field_row("Source", source_dropdown->Render() | size(WIDTH, EQUAL, 30), 10));
             if (source_selected_ == 1) {
                 setup.push_back(text("Outlook on the web -> Settings -> Calendar -> Shared calendars ->") | dim);
                 setup.push_back(text("Publish a calendar -> 'Can view all details' -> copy the ICS link.") | dim);
@@ -720,8 +721,8 @@ void CalendarScreen::build_ui() {
             } else {
                 setup.push_back(text("Calendar import is off.") | dim);
             }
-            setup.push_back(save_btn->Render());
-            children.push_back(vbox(std::move(setup)) | borderStyled(ROUNDED, theme::kMuted));
+            setup.push_back(hbox({filler(), save_btn->Render()}));
+            children.push_back(section("Calendar source", vbox(std::move(setup))));
         }
 
         if (view_selected_ == 1) {

@@ -8,6 +8,7 @@
 
 #include "ui/styled_input.hpp"
 #include "ui/theme.hpp"
+#include "ui/widgets.hpp"
 #include "ui/wrapped_input.hpp"
 #include "util/date_format.hpp"
 #include "util/time.hpp"
@@ -223,14 +224,14 @@ void ProposedTasksPanel::build_ui() {
     rows_container_ = Container::Vertical({});
 
     auto confirm_all_btn = Button(
-        " Confirm all ", [this] { confirm_all(); }, ButtonOption::Animated(theme::kSuccess));
+        " Confirm all ", [this] { confirm_all(); }, button_style(theme::kSuccess));
     auto discard_all_btn = Button(
         " Discard all ", [this] {
             for (const std::shared_ptr<Row>& row : rows_) ctx_.repo->delete_task(row->id);
             status_message_ = "Proposed tasks discarded.";
             needs_rebuild_ = true;
         },
-        ButtonOption::Animated(theme::kDanger));
+        button_style(theme::kDanger));
 
     auto layout = Container::Vertical({Container::Horizontal({confirm_all_btn, discard_all_btn}), rows_container_});
     // With nothing to review the panel draws nothing, so its controls must also

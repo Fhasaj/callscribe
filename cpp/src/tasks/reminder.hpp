@@ -32,6 +32,9 @@ public:
 
     void set_reminder_time(const std::string& time);
     void set_enabled(bool enabled);
+    // The end-of-day wrap-up nudge: once a day at `time`, unless today's log
+    // has already been saved.
+    void set_end_of_day(const std::string& time, bool enabled);
 
     std::vector<db::Task> fire_now();
 
@@ -45,6 +48,9 @@ private:
     std::string reminder_time_;
     bool enabled_;
     std::string last_fired_date_;
+    std::string end_of_day_time_ = "17:30";
+    bool end_of_day_enabled_ = false;
+    std::string last_end_of_day_date_;
 
     std::mutex callback_mutex_;
     Callback on_fired_;

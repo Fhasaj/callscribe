@@ -43,8 +43,16 @@ private:
 
     ftxui::Component root_;
 
+    // Questions of the user's own, pasted from their review form.
+    std::string own_questions_;
+
     void load_stats();
+    int selected_year() const;
+    // The wizard's picks.
     void generate_review_report();
+    // Answers `questions` from everything recorded in the selected year, on
+    // the worker thread. `cycle_label` is "" for the user's own questions.
+    void answer_questions(std::vector<std::string> questions, std::string cycle_label);
     void build_ui();
 };
 

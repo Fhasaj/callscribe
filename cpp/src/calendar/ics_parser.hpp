@@ -27,6 +27,8 @@ struct Event {
     bool all_day = false;
     bool recurring = false;  // this instance came from an RRULE
     bool busy = true;        // false for TRANSP:TRANSPARENT ("show as free")
+    // Outlook's "show as: Out of office" (X-MICROSOFT-CDO-BUSYSTATUS:OOF).
+    bool out_of_office = false;
 };
 
 // Parses an iCalendar document and returns every occurrence overlapping

@@ -1,6 +1,7 @@
 #include "ui/summary_screen.hpp"
 
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/terminal.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -9,6 +10,7 @@
 #include "ui/scroll_pane.hpp"
 #include "ui/styled_input.hpp"
 #include "ui/theme.hpp"
+#include "ui/widgets.hpp"
 #include "ui/wrapped_input.hpp"
 #include "util/clipboard.hpp"
 #include "util/time.hpp"
@@ -52,15 +54,15 @@ SummaryScreen::~SummaryScreen() {
     if (worker_.joinable()) worker_.join();
 }
 
-void SummaryScreen::load_stats() {
-    int year;
+int SummaryScreen::selected_year() const {
     try {
-        year = std::stoi(year_text_);
+        return std::stoi(year_text_);
     } catch (...) {
-        year = util::current_year();
+        return util::current_year();
     }
-    stats_ = ctx_.repo->yearly_stats(year);
 }
+
+void SummaryScreen::load_stats() { stats_ = ctx_.repo->yearly_stats(selected_year()); }
 
 void SummaryScreen::generate_review_report() {
     bool annual = cycle_index_ == 1;
@@ -76,45 +78,55 @@ void SummaryScreen::generate_review_report() {
         status_message_ = "Pick at least one question to answer.";
         return;
     }
+    answer_questions(std::move(questions), annual ? "annual" : "semi-annual");
+}
 
-    std::string model = ctx_.settings.ollama_model;
+void SummaryScreen::answer_questions(std::vector<std::string> questions, std::string cycle_label) {
+    std::string model = ctx_.settings.llm_model();
     if (model.empty()) {
         std::lock_guard<std::mutex> lock(mutex_);
-        status_message_ = "No Ollama model selected -- pick one in Settings.";
+        status_message_ = "No AI model selected -- pick one in Settings.";
         return;
     }
-    if (stats_.summaries.empty()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        status_message_ = "No call notes recorded for this year yet.";
-        return;
-    }
-    int year;
-    try {
-        year = std::stoi(year_text_);
-    } catch (...) {
-        year = util::current_year();
-    }
-
-    if (worker_.joinable()) worker_.join();
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (generating_) return;
         generating_ = true;
-        status_message_ = "Generating...";
+        status_message_ = "Reading the year's notes...";
     }
-    std::string cycle_label = annual ? "annual" : "semi-annual";
-    db::YearlyStats stats_copy = stats_;
-    worker_ = std::thread([this, model, year, cycle_label, questions, stats_copy] {
-        std::string result_text, error_text;
+    if (worker_.joinable()) worker_.join();
+
+    const int year = selected_year();
+    const std::string host = ctx_.settings.llm_host();
+    const std::string user_name = ctx_.settings.user_display_name;
+    worker_ = std::thread([this, model, host, user_name, year, questions, cycle_label] {
+        std::string result_text, error_text, note;
         try {
-            result_text =
-                llm::generate_review_report(ctx_.settings.ollama_host, model, year, cycle_label, questions, stats_copy);
+            llm::ReviewMaterial material = llm::collect_review_material(*ctx_.repo, year);
+            if (material.evidence.empty() && material.facts.call_count == 0) {
+                error_text = "Nothing recorded for " + std::to_string(year) + " yet.";
+            } else {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_message_ = "Writing answers from " + std::to_string(material.evidence.size()) +
+                                      " notes... (a big model can take a few minutes)";
+                }
+                auto report = llm::generate_review_report(host, model, user_name, cycle_label, questions,
+                                                          material.facts, std::move(material.evidence));
+                result_text = report.text;
+                note = "Answered from " + std::to_string(report.evidence_used) +
+                       (report.evidence_used < report.evidence_total
+                            ? " of " + std::to_string(report.evidence_total) + " notes (the most relevant that fit)"
+                            : " notes") +
+                       ". Check every claim before pasting.";
+            }
         } catch (const std::exception& e) {
             error_text = e.what();
         }
         std::lock_guard<std::mutex> lock(mutex_);
         if (error_text.empty()) {
             report_ = result_text;
-            status_message_.clear();
+            status_message_ = note;
         } else {
             status_message_ = "Failed: " + error_text;
         }
@@ -129,29 +141,46 @@ void SummaryScreen::build_ui() {
     year_opt.multiline = false;
     year_opt.on_enter = [this] { load_stats(); };
     auto year_input = WrappedInput(&year_text_, "Year", year_opt);
-    auto load_button = Button("Load stats", [this] { load_stats(); });
+    auto load_button = Button("Load", [this] { load_stats(); }, button_style(theme::kMuted));
     auto report_button = Button(
-        "Generate review report (uses local LLM)",
+        "Standard review questions...",
         [this] {
             wizard_step_ = 0;
             wizard_visible_ = true;
         },
-        ButtonOption::Animated(theme::kAccent));
+        button_style(theme::kAccent));
+    InputOption questions_opt;
+    questions_opt.multiline = true;
+    auto questions_input = WrappedInput(
+        &own_questions_, "Paste questions from your review form -- a blank line between each", questions_opt);
+    auto answer_button = Button(
+        "Answer these (uses local AI)",
+        [this] {
+            auto questions = llm::split_questions(own_questions_);
+            if (questions.empty()) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                status_message_ = "Paste at least one question first.";
+                return;
+            }
+            answer_questions(std::move(questions), "");
+        },
+        button_style(theme::kSuccess));
     auto copy_button = Button("Copy report", [this] {
         std::lock_guard<std::mutex> lock(mutex_);
         util::copy_to_clipboard(report_);
-    });
+    }, button_style(theme::kMuted));
 
     auto report_pane = ScrollableText(
         [this] {
             std::lock_guard<std::mutex> lock(mutex_);
             return report_;
         },
-        "(not generated yet)");
+        "Answers appear here.", "Answers");
 
     auto layout = Container::Vertical({
         Container::Horizontal({year_input, load_button}),
-        report_button,
+        questions_input,
+        Container::Horizontal({answer_button, report_button}),
         report_pane,
         copy_button,
     });
@@ -174,16 +203,16 @@ void SummaryScreen::build_ui() {
     auto question_checks = Container::Tab({semi_checks, annual_checks}, &cycle_index_);
 
     auto wizard_next = Button(
-        "Next >", [this] { wizard_step_ = 1; }, ButtonOption::Animated(theme::kAccent));
-    auto wizard_back = Button("< Back", [this] { wizard_step_ = 0; });
+        "Next >", [this] { wizard_step_ = 1; }, button_style(theme::kAccent));
+    auto wizard_back = Button("< Back", [this] { wizard_step_ = 0; }, button_style(theme::kMuted));
     auto wizard_generate = Button(
         "Generate",
         [this] {
             wizard_visible_ = false;
             generate_review_report();
         },
-        ButtonOption::Animated(theme::kSuccess));
-    auto wizard_cancel = Button("Cancel", [this] { wizard_visible_ = false; });
+        button_style(theme::kSuccess));
+    auto wizard_cancel = Button("Cancel", [this] { wizard_visible_ = false; }, button_style(theme::kMuted));
 
     auto step0_buttons = Container::Horizontal({wizard_next, wizard_cancel});
     auto step1_buttons = Container::Horizontal({wizard_generate, wizard_back, wizard_cancel});
@@ -213,7 +242,8 @@ void SummaryScreen::build_ui() {
                clear_under | center;
     });
 
-    root_ = Renderer(layout, [this, year_input, load_button, report_button, report_pane, copy_button] {
+    root_ = Renderer(layout, [this, year_input, load_button, questions_input, answer_button, report_button,
+                              report_pane, copy_button] {
         std::string status_copy;
         bool generating_now;
         {
@@ -224,60 +254,80 @@ void SummaryScreen::build_ui() {
 
         double hours = stats_.total_seconds / 3600.0;
 
-        Elements children;
-        children.push_back(text("CallScribe -- Yearly Summary") | bold | color(theme::kAccent));
-        children.push_back(separator() | color(theme::kMuted));
-        children.push_back(hbox({
-            text("Year: "),
-            year_input->Render() | size(WIDTH, EQUAL, 8),
-            text(" "),
-            load_button->Render(),
-        }));
-        children.push_back(text("Calls: " + std::to_string(stats_.call_count) +
-                                 "    Total call time: " + format_hours(hours) +
-                                 "h    Tasks completed: " + std::to_string(stats_.tasks_completed)));
+        // -- year at a glance (fixed-width column) -------------------------
+        constexpr int kGlanceWidth = 50;
+        constexpr int kGraphWidth = kGlanceWidth - 4;  // section border + graph border
+        std::string months(kGraphWidth, ' ');
+        const char* initials = "JFMAMJJASOND";
+        for (int m = 0; m < 12; ++m) months[static_cast<size_t>((m * 2 + 1) * kGraphWidth / 24)] = initials[m];
 
-        children.push_back(separator() | color(theme::kMuted));
-        children.push_back(text("Calls per month:") | bold | color(theme::kAccent));
-        children.push_back(graph([this](int width, int height) {
-                                std::vector<int> out(static_cast<size_t>(width), 0);
-                                int max_count = 0;
-                                for (int c : stats_.monthly_call_counts) max_count = std::max(max_count, c);
-                                if (max_count == 0 || width <= 0) return out;
-                                for (int i = 0; i < width; ++i) {
-                                    int month = std::min(11, i * 12 / width);
-                                    out[static_cast<size_t>(i)] =
-                                        stats_.monthly_call_counts[static_cast<size_t>(month)] * height / max_count;
-                                }
-                                return out;
-                            }) |
-                            color(theme::kAccent) | size(HEIGHT, EQUAL, 6) | borderStyled(ROUNDED, theme::kMuted));
-
-        children.push_back(separator() | color(theme::kMuted));
-        children.push_back(text("Top customers:") | bold | color(theme::kAccent));
+        Elements glance = {
+            hbox({text("Year ") | color(Color::GrayLight) | vcenter, year_input->Render() | size(WIDTH, EQUAL, 8),
+                  text(" "), load_button->Render(), filler()}),
+            hbox({text(std::to_string(stats_.call_count)) | bold, text(" calls  ") | dim,
+                  text(format_hours(hours) + "h") | bold, text(" on calls  ") | dim,
+                  text(std::to_string(stats_.tasks_completed)) | bold, text(" tasks done") | dim}),
+            text(""),
+            text("Calls per month") | color(Color::GrayLight),
+            vbox({graph([this](int width, int height) {
+                      std::vector<int> out(static_cast<size_t>(width), 0);
+                      int max_count = 0;
+                      for (int c : stats_.monthly_call_counts) max_count = std::max(max_count, c);
+                      if (max_count == 0 || width <= 0) return out;
+                      for (int i = 0; i < width; ++i) {
+                          int month = std::min(11, i * 12 / width);
+                          out[static_cast<size_t>(i)] =
+                              stats_.monthly_call_counts[static_cast<size_t>(month)] * height / max_count;
+                      }
+                      return out;
+                  }) | color(theme::kAccent) | size(HEIGHT, EQUAL, 5),
+                  text(months) | dim}) |
+                borderStyled(ROUNDED, theme::kMuted),
+            text(""),
+            text("Top customers") | color(Color::GrayLight),
+        };
         {
             int max_customer = 0;
             for (auto& c : stats_.top_customers) max_customer = std::max(max_customer, c.second);
-            Elements customer_rows;
             for (size_t i = 0; i < stats_.top_customers.size() && i < 5; ++i) {
                 const auto& [name, count] = stats_.top_customers[i];
                 float progress = max_customer > 0 ? static_cast<float>(count) / static_cast<float>(max_customer) : 0.0f;
-                customer_rows.push_back(hbox({
-                    text(name) | size(WIDTH, EQUAL, 22),
+                glance.push_back(hbox({
+                    text(name) | size(WIDTH, EQUAL, 18),
                     gauge(progress) | color(theme::kAccent) | flex,
-                    text("  " + std::to_string(count)),
+                    text(" " + std::to_string(count)) | size(WIDTH, EQUAL, 4),
                 }));
             }
-            if (customer_rows.empty()) customer_rows.push_back(text("n/a") | dim);
-            children.push_back(vbox(customer_rows));
+            if (stats_.top_customers.empty()) glance.push_back(text("No calls with a customer yet") | dim);
         }
-        children.push_back(separator() | color(theme::kMuted));
-        children.push_back(report_button->Render());
-        if (generating_now) children.push_back(text("Working...") | color(theme::kWarning));
-        if (!status_copy.empty()) children.push_back(text(status_copy) | dim);
-        children.push_back(report_pane->Render() | flex);
-        children.push_back(copy_button->Render());
+        Element glance_section = section("Year at a glance", vbox(std::move(glance))) | size(WIDTH, EQUAL, kGlanceWidth);
 
+        // -- review answers -------------------------------------------------
+        Elements answers = {
+            paragraph("Paste the questions from your review form. Answers are written from your call notes, "
+                      "completed tasks, wins (^W), focus notes and daily notes for the year.") |
+                dim,
+            questions_input->Render() | size(HEIGHT, GREATER_THAN, 3) | size(HEIGHT, LESS_THAN, 8) |
+                borderStyled(ROUNDED, theme::kMuted),
+            hbox({answer_button->Render(), text(" "), report_button->Render(), filler()}),
+        };
+        if (generating_now) answers.push_back(text("Working...") | color(theme::kWarning));
+        if (!status_copy.empty()) answers.push_back(paragraph(status_copy) | dim);
+        Element answers_section = section("Review answers", vbox(std::move(answers)));
+
+        Elements children;
+        if (ftxui::Terminal::Size().dimx >= 110) {
+            children.push_back(hbox({glance_section, text(" "),
+                                     vbox({answers_section, report_pane->Render() | flex,
+                                           hbox({filler(), copy_button->Render()})}) |
+                                         flex}) |
+                               flex);
+        } else {
+            children.push_back(glance_section | xflex);
+            children.push_back(answers_section);
+            children.push_back(report_pane->Render() | flex);
+            children.push_back(hbox({filler(), copy_button->Render()}));
+        }
         return vbox(children) | flex;
     });
 

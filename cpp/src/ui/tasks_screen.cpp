@@ -1,12 +1,15 @@
 #include "ui/tasks_screen.hpp"
 
+#include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
 
 #include <algorithm>
 #include <cctype>
 
+#include "llm/summarizer.hpp"
 #include "ui/styled_input.hpp"
 #include "ui/theme.hpp"
+#include "ui/widgets.hpp"
 #include "ui/wrapped_input.hpp"
 #include "util/date_format.hpp"
 #include "util/time.hpp"
@@ -56,6 +59,71 @@ std::string priority_display(const std::string& priority) {
 TasksScreen::TasksScreen(AppContext& ctx) : ctx_(ctx) {
     build_ui();
     refresh();
+}
+
+TasksScreen::~TasksScreen() {
+    if (breakdown_worker_.joinable()) breakdown_worker_.join();
+}
+
+void TasksScreen::start_breakdown(int index) {
+    if (index < 0 || index >= static_cast<int>(tasks_.size()) || breaking_down_.exchange(true)) return;
+    if (breakdown_worker_.joinable()) breakdown_worker_.join();
+
+    breakdown_task_ = tasks_[static_cast<size_t>(index)];
+    status_message_ = "Breaking down \"" + breakdown_task_.description + "\"...";
+    const std::string host = ctx_.settings.llm_host();
+    const std::string model = ctx_.settings.llm_model();
+    const db::Task task = breakdown_task_;
+    breakdown_worker_ = std::thread([this, host, model, task] {
+        std::vector<std::string> steps;
+        std::string error;
+        try {
+            steps = llm::break_down_task(host, model, task.description, task.customer_name, task.due_date);
+            if (steps.empty()) error = "The model didn't suggest any steps -- try again?";
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        std::lock_guard<std::mutex> lock(breakdown_mutex_);
+        breakdown_result_ = std::move(steps);
+        breakdown_error_ = std::move(error);
+        breakdown_ready_ = true;
+    });
+}
+
+void TasksScreen::take_breakdown_result() {
+    {
+        std::lock_guard<std::mutex> lock(breakdown_mutex_);
+        if (!breakdown_ready_) return;
+        breakdown_ready_ = false;
+        breakdown_steps_ = std::move(breakdown_result_);
+        if (!breakdown_error_.empty()) status_message_ = "Couldn't break it down: " + breakdown_error_;
+    }
+    breaking_down_.store(false);
+    if (breakdown_steps_.empty()) return;
+    status_message_.clear();
+
+    using namespace ftxui;
+    breakdown_checked_.assign(breakdown_steps_.size(), true);
+    breakdown_list_->DetachAllChildren();
+    for (size_t i = 0; i < breakdown_steps_.size(); ++i)
+        breakdown_list_->Add(Checkbox(breakdown_steps_[i], &breakdown_checked_[i]));
+    breakdown_visible_ = true;
+    breakdown_first_->TakeFocus();
+}
+
+void TasksScreen::add_breakdown_steps() {
+    int added = 0;
+    for (size_t i = 0; i < breakdown_steps_.size(); ++i) {
+        if (!breakdown_checked_[i]) continue;
+        // Same customer, due date and priority as the task they came from, so
+        // they sort and remind alongside it.
+        ctx_.repo->add_task(breakdown_steps_[i], std::nullopt, breakdown_task_.customer_id, breakdown_task_.due_date,
+                            "breakdown", breakdown_task_.priority);
+        ++added;
+    }
+    breakdown_visible_ = false;
+    status_message_ = added ? "Added " + std::to_string(added) + " step(s)." : "";
+    needs_refresh_ = true;
 }
 
 void TasksScreen::refresh() {
@@ -136,13 +204,15 @@ void TasksScreen::refresh() {
             "[edit]", [this, i] { begin_edit(static_cast<int>(i)); }, row_button_option(theme::kAccent));
         auto delete_btn = Button(
             "[x]", [this, i] { delete_task_at(static_cast<int>(i)); }, row_button_option(theme::kDanger));
+        auto steps_btn = Button(
+            "[steps]", [this, i] { start_breakdown(static_cast<int>(i)); }, row_button_option(theme::kSuccess));
 
-        auto controls = Container::Horizontal({checkbox, edit_btn, delete_btn});
+        auto controls = Container::Horizontal({checkbox, steps_btn, edit_btn, delete_btn});
         // The due date / priority / customer live on their own line under the
         // description, so a long description doesn't push them off-screen.
         bool being_edited = task.id == editing_id_;
-        task_list_container_->Add(Renderer(controls, [this, controls, checkbox, edit_btn, delete_btn, task, state,
-                                                       being_edited] {
+        task_list_container_->Add(Renderer(controls, [this, controls, checkbox, steps_btn, edit_btn, delete_btn, task,
+                                                       state, being_edited] {
             Elements meta;
             meta.push_back(text("    "));
             if (task.due_date.empty()) {
@@ -171,6 +241,10 @@ void TasksScreen::refresh() {
             // the description: the list renders inside a `frame`, so a long
             // description would otherwise push them off the right edge.
             meta.push_back(text("   "));
+            if (task.status != db::kStatusDone) {
+                meta.push_back(steps_btn->Render());
+                meta.push_back(text(" "));
+            }
             meta.push_back(edit_btn->Render());
             meta.push_back(text(" "));
             meta.push_back(delete_btn->Render());
@@ -278,23 +352,23 @@ void TasksScreen::build_ui() {
     InputOption due_opt = styled_input_option();
     due_opt.multiline = false;
     due_opt.on_enter = [this] { submit_form(); };
-    auto due_input = WrappedInput(&form_due_, "Due DD MM YYYY / today / tomorrow", due_opt);
+    auto due_input = WrappedInput(&form_due_, "Due: today / DD MM YYYY", due_opt);
 
     InputOption customer_opt = styled_input_option();
     customer_opt.multiline = false;
     customer_opt.on_enter = [this] { submit_form(); };
     auto customer_input = WrappedInput(&form_customer_, "Customer (optional)", customer_opt);
 
-    auto priority_toggle = Toggle(&kPriorityLabels, &form_priority_);
+    auto priority_toggle = Menu(&kPriorityLabels, &form_priority_, MenuOption::Horizontal());
 
-    ButtonOption submit_opt = ButtonOption::Animated(theme::kAccent);
+    ButtonOption submit_opt;
     submit_opt.transform = [this](const EntryState& s) {
-        Element e = text(editing_id_ >= 0 ? " Save Changes " : " Add Task ") | bold | color(theme::kAccent);
-        if (s.focused) e |= inverted;
-        return e;
+        EntryState labelled = s;
+        labelled.label = editing_id_ >= 0 ? "Save changes" : "Add task";
+        return button_style(theme::kAccent).transform(labelled);
     };
     auto submit_button = Button("Add Task", [this] { submit_form(); }, submit_opt);
-    auto cancel_button = Button(" Cancel ", [this] { cancel_edit(); }, ButtonOption::Ascii());
+    auto cancel_button = Button("Cancel", [this] { cancel_edit(); }, button_style(theme::kMuted));
     auto cancel_slot = Maybe(cancel_button, [this] { return editing_id_ >= 0; });
 
     CheckboxOption show_done_opt;
@@ -305,61 +379,80 @@ void TasksScreen::build_ui() {
                                             cancel_slot});
     auto layout = Container::Vertical({form_row, show_done_checkbox, task_list_container_});
 
+    breakdown_list_ = Container::Vertical({});
+    auto add_steps_btn = Button("Add ticked steps", [this] { add_breakdown_steps(); },
+                                button_style(theme::kSuccess));
+    auto cancel_steps_btn = Button("Cancel", [this] { breakdown_visible_ = false; }, button_style(theme::kMuted));
+    breakdown_first_ = add_steps_btn;
+    auto breakdown_container =
+        Container::Vertical({breakdown_list_, Container::Horizontal({add_steps_btn, cancel_steps_btn})});
+    auto breakdown_modal = Renderer(breakdown_container, [this, add_steps_btn, cancel_steps_btn] {
+                               return vbox({
+                                          text("First steps") | bold | color(theme::kSuccess),
+                                          paragraph(breakdown_task_.description) | dim,
+                                          separator() | color(theme::kMuted),
+                                          breakdown_list_->Render(),
+                                          separator() | color(theme::kMuted),
+                                          text("Untick any you don't want. They're added as tasks with the same "
+                                               "customer and due date.") |
+                                              dim,
+                                          hbox({add_steps_btn->Render(), text("  "), cancel_steps_btn->Render()}) |
+                                              hcenter,
+                                      }) |
+                                      size(WIDTH, EQUAL, 76) | borderStyled(ROUNDED, theme::kSuccess) |
+                                      bgcolor(Color::Black) | clear_under | center;
+                           }) |
+                           CatchEvent([this](const Event& e) {
+                               if (e != Event::Escape) return false;
+                               breakdown_visible_ = false;
+                               return true;
+                           });
+
     root_ = Renderer(layout, [this, desc_input, due_input, priority_toggle, customer_input, submit_button, cancel_slot,
                                show_done_checkbox] {
+        take_breakdown_result();
         if (needs_refresh_ || ctx_.repo->revision() != seen_revision_) {
             needs_refresh_ = false;
             refresh();
         }
 
         Elements children;
-        children.push_back(text("CallScribe -- Tasks") | bold | color(theme::kAccent));
 
-        Elements summary_parts = {text(std::to_string(open_count_) + " open")};
-        if (due_today_count_ > 0) {
-            summary_parts.push_back(text("   "));
-            summary_parts.push_back(text(std::to_string(due_today_count_) + " due today") | color(theme::kWarning));
-        }
-        if (overdue_count_ > 0) {
-            summary_parts.push_back(text("   "));
-            summary_parts.push_back(text(std::to_string(overdue_count_) + " overdue") | color(theme::kDanger) | bold);
-        }
-        children.push_back(hbox(summary_parts));
-        children.push_back(separator() | color(theme::kMuted));
-
-        children.push_back(hbox({
-            desc_input->Render() | flex,
-            text(" "),
-            due_input->Render() | size(WIDTH, EQUAL, 30),
-        }));
-        children.push_back(hbox({
-            text("Priority ") | color(theme::kMuted),
-            priority_toggle->Render(),
-            text("   "),
-            customer_input->Render() | size(WIDTH, EQUAL, 28),
-            text(" "),
-            submit_button->Render(),
-            text(" "),
-            cancel_slot->Render(),
-        }));
-        children.push_back(show_done_checkbox->Render());
+        Element form = vbox({
+            hbox({
+                desc_input->Render() | flex,
+                text(" "),
+                due_input->Render() | size(WIDTH, EQUAL, 34),
+            }),
+            hbox({
+                text("Priority ") | color(Color::GrayLight) | vcenter,
+                priority_toggle->Render() | vcenter,
+                text("   "),
+                customer_input->Render() | size(WIDTH, EQUAL, 30),
+                filler(),
+                cancel_slot->Render(),
+                text(" "),
+                submit_button->Render(),
+            }),
+        });
+        children.push_back(section(editing_id_ >= 0 ? "Edit task" : "New task", form,
+                                   editing_id_ >= 0 ? theme::kWarning : theme::kAccent));
         if (!status_message_.empty()) {
-            children.push_back(text(status_message_) |
-                                color(editing_id_ >= 0 ? theme::kWarning : theme::kDanger));
+            children.push_back(paragraph(status_message_) |
+                               color(editing_id_ >= 0 ? theme::kWarning : theme::kDanger));
         }
 
-        if (overdue_count_ > 0) {
-            children.push_back(text(std::to_string(overdue_count_) + " task(s) overdue -- take a look") |
-                                color(theme::kDanger) | bold);
-        } else if (due_today_count_ > 0) {
-            children.push_back(text(std::to_string(due_today_count_) + " task(s) due today") | color(theme::kWarning));
-        }
-
-        children.push_back(separator() | color(theme::kMuted));
-        children.push_back(task_list_container_->Render() | frame | flex);
+        Elements counts = {badge(std::to_string(open_count_) + " open", theme::kAccent)};
+        if (due_today_count_ > 0) counts.push_back(badge(std::to_string(due_today_count_) + " due today", theme::kWarning));
+        if (overdue_count_ > 0) counts.push_back(badge(std::to_string(overdue_count_) + " overdue", theme::kDanger));
+        counts.push_back(filler());
+        counts.push_back(show_done_checkbox->Render());
+        children.push_back(hbox(std::move(counts)));
+        children.push_back(task_list_container_->Render() | frame | flex | borderStyled(ROUNDED, theme::kMuted));
 
         return vbox(children) | flex;
     });
+    root_ |= Modal(breakdown_modal, &breakdown_visible_);
 }
 
 }  // namespace callscribe::ui

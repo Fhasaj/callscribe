@@ -9,6 +9,7 @@
 
 #include "ui/text_wrap.hpp"
 #include "ui/theme.hpp"
+#include "ui/widgets.hpp"
 
 namespace callscribe::ui {
 
@@ -19,10 +20,11 @@ using namespace ftxui;
 class ScrollPaneBase : public ComponentBase {
 public:
     ScrollPaneBase(std::function<Element(int width)> provider, std::function<int(int width)> line_count,
-                    std::function<int()> follow_key = nullptr)
+                    std::function<int()> follow_key = nullptr, std::string title = "")
         : provider_(std::move(provider)),
           line_count_(std::move(line_count)),
-          follow_key_(std::move(follow_key)) {}
+          follow_key_(std::move(follow_key)),
+          title_(std::move(title)) {}
 
     Element OnRender() override {
         // box_ spans the whole pane, but vscroll_indicator keeps the rightmost
@@ -49,7 +51,10 @@ public:
                        reflect(box_);
         // Highlight the border while focused so it's clear which pane the
         // arrow keys will drive.
-        return pane | borderStyled(ROUNDED, Focused() ? theme::kAccent : theme::kMuted);
+        const Color frame = Focused() ? theme::kAccent : theme::kMuted;
+        if (!title_.empty())
+            return titled_border(pane, text(" " + title_ + " ") | bold | color(theme::kAccent), frame);
+        return pane | borderStyled(ROUNDED, frame);
     }
 
     bool Focusable() const override { return true; }
@@ -103,6 +108,7 @@ private:
     std::function<Element(int width)> provider_;
     std::function<int(int width)> line_count_;
     std::function<int()> follow_key_;
+    std::string title_;
     int last_follow_key_ = -1;
     float scroll_ = 0.f;  // 0 = top, 1 = bottom
     Box box_;
@@ -110,9 +116,69 @@ private:
     int view_lines_ = 1;
 };
 
+class ScrollFormBase : public ComponentBase {
+public:
+    explicit ScrollFormBase(Component form) : form_(std::move(form)) { Add(form_); }
+
+    Element OnRender() override {
+        Element content = form_->Render();
+        // Measured from the layout rather than with reflect(): reflect reports
+        // only the part that is on screen, which is exactly the part that
+        // doesn't tell us how far there is to scroll.
+        content->ComputeRequirement();
+        const Requirement& req = content->requirement();
+        content_lines_ = req.min_y;
+
+        const int ext = std::max(0, box_.y_max - box_.y_min);
+        const int max_offset = std::max(0, content_lines_ - view_lines());
+        if (follow_focus_) {
+            // yframe centres whatever the focused component marked. Mirror its
+            // arithmetic so that when the wheel takes over it starts from the
+            // row actually on screen instead of jumping.
+            const auto& focused = req.focused.box;
+            offset_ = focused.y_min - ext / 2 + (focused.y_max - focused.y_min) / 2;
+        } else {
+            // focusPosition overrides the focused component's mark with a row
+            // of our own, chosen so yframe's centring lands on offset_.
+            content = content | focusPosition(0, std::clamp(offset_, 0, max_offset) + ext / 2);
+        }
+        offset_ = std::clamp(offset_, 0, max_offset);
+        return content | vscroll_indicator | yframe | flex | reflect(box_);
+    }
+
+    bool OnEvent(Event event) override {
+        if (event.is_mouse()) {
+            const auto& m = event.mouse();
+            if (box_.Contain(m.x, m.y) && (m.button == Mouse::WheelUp || m.button == Mouse::WheelDown)) {
+                follow_focus_ = false;
+                offset_ += m.button == Mouse::WheelUp ? -kWheelLines : kWheelLines;
+                offset_ = std::clamp(offset_, 0, std::max(0, content_lines_ - view_lines()));
+                return true;
+            }
+            return form_->OnEvent(event);
+        }
+
+        const bool handled = form_->OnEvent(event);
+        // The ticker's redraws aren't the user moving anywhere.
+        if (handled && event != Event::Custom) follow_focus_ = true;
+        return handled;
+    }
+
+private:
+    static constexpr int kWheelLines = 3;
+
+    int view_lines() const { return std::max(1, box_.y_max - box_.y_min + 1); }
+
+    Component form_;
+    bool follow_focus_ = true;
+    int offset_ = 0;  // first visible row
+    int content_lines_ = 0;
+    Box box_;
+};
+
 }  // namespace
 
-ftxui::Component ScrollableText(std::function<std::string()> provider, std::string placeholder) {
+ftxui::Component ScrollableText(std::function<std::string()> provider, std::string placeholder, std::string title) {
     // Wrap once per render and reuse for both the element and the line count,
     // so a mid-render change can't make them disagree.
     auto wrapped = std::make_shared<std::string>();
@@ -124,12 +190,14 @@ ftxui::Component ScrollableText(std::function<std::string()> provider, std::stri
     auto lines = [wrapped](int) {
         return 1 + static_cast<int>(std::count(wrapped->begin(), wrapped->end(), '\n'));
     };
-    return ftxui::Make<ScrollPaneBase>(element, lines);
+    return ftxui::Make<ScrollPaneBase>(element, lines, nullptr, std::move(title));
 }
 
 ftxui::Component ScrollableContent(std::function<ftxui::Element(int width)> provider,
                                     std::function<int()> follow_key) {
     return ftxui::Make<ScrollPaneBase>(std::move(provider), nullptr, std::move(follow_key));
 }
+
+ftxui::Component ScrollableForm(ftxui::Component form) { return ftxui::Make<ScrollFormBase>(std::move(form)); }
 
 }  // namespace callscribe::ui

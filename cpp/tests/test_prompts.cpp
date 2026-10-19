@@ -17,6 +17,18 @@ TEST_CASE("summary prompt includes context and JSON instructions") {
     CHECK(prompt.find("\"tasks\"") != std::string::npos);
 }
 
+TEST_CASE("summary prompt scopes tasks to the user and lists dates to look up") {
+    std::string prompt = build_summary_prompt("x", "Acme", "Sync", "Jane", "19 10 2026", "", "", "", "Fatlum Hasaj");
+    CHECK(prompt.find("Fatlum Hasaj's own to-do items") != std::string::npos);
+    CHECK(prompt.find("labelled \"Fatlum Hasaj:\"") != std::string::npos);
+    CHECK(prompt.find("someone else will do") != std::string::npos);
+    CHECK(prompt.find("Monday 2026-10-19 (call day)") != std::string::npos);
+    CHECK(prompt.find("Tuesday 2026-10-20 (tomorrow)") != std::string::npos);
+    CHECK(prompt.find("Friday 2026-10-23") != std::string::npos);
+    // ISO dates work too, and the table runs two weeks.
+    CHECK(build_summary_prompt("x", "", "", "", "2026-10-19").find("Sunday 2026-11-01") != std::string::npos);
+}
+
 TEST_CASE("summary prompt handles empty transcript/customer") {
     std::string prompt = build_summary_prompt("", "", "", "", "2026-07-28");
     CHECK(prompt.find("no speech detected") != std::string::npos);
